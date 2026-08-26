@@ -1,0 +1,8 @@
+# Core -- the measurement mathematics needs only these.
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.10
+
+# Optional: real-video vehicle detection. Everything except `main.py video`
+# works without it, including the full test suite against synthetic ground truth.
+# ultralytics>=8.3
