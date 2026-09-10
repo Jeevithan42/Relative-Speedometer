@@ -132,6 +132,37 @@ def test_scale_estimator_recovers_known_scale():
     assert abs(m.s - true_s) / true_s < 0.01, (m.s, true_s)
 
 
+def test_taper_must_not_be_enabled_by_default():
+    """Regression guard: a fixed Hann window is not scale-equivariant.
+
+    It was briefly enabled to cure a small bias on static real footage, and it
+    under-reported a known synthetic scaling by 22% (1.0868 for a true 1.1111).
+    A systematic under-report of scale is a systematic under-report of speed.
+    """
+    from rspeed.geometry import focal_length_px as _f
+    seq = synth.SyntheticSequence(f_px=_f(1280, 60.0), image_width=1280, image_height=720)
+    import cv2 as _cv2
+    img_a, bbox_a, _wp, _wc = seq.render(30.0, 0.0)
+    img_b, _b, _wp2, _wc2 = seq.render(27.0, 0.5)
+    ga = _cv2.cvtColor(img_a, _cv2.COLOR_BGR2GRAY)
+    gb = _cv2.cvtColor(img_b, _cv2.COLOR_BGR2GRAY)
+    x, y, w, h = bbox_a
+    center = (x + w / 2.0, y + h * 0.70)
+    true_s = 30.0 / 27.0
+
+    plain = ScaleEstimator()
+    plain.anchor(ga, center, float(w), 0.0)
+    m_plain = plain.measure(gb, center, 0.5)
+
+    tapered = ScaleEstimator(taper=True)
+    tapered.anchor(ga, center, float(w), 0.0)
+    m_taper = tapered.measure(gb, center, 0.5)
+
+    assert m_plain is not None and m_taper is not None
+    assert abs(m_plain.s - true_s) < abs(m_taper.s - true_s), (m_plain.s, m_taper.s)
+    assert ScaleEstimator()._window is None, "taper must default to off"
+
+
 # --- section 7: filter -------------------------------------------------------------------------
 
 

@@ -88,6 +88,13 @@ class VehicleEstimator:
         self._t_last_plate: float = -math.inf
         self._frames = 0
         self._nis_log: list[float] = []
+        # Why Channel A failed, counted. "calibrated 0%" with no reason is a dead end
+        # for the user -- these distinguish "found nothing" from "found it and threw it
+        # away", which have completely different fixes.
+        self.reject: dict[str, int] = {
+            "not_found": 0, "low_quality": 0, "bad_aspect": 0, "gated": 0, "ok": 0
+        }
+        self.last_quality: float | None = None
 
     # -- scheduling, MATH.md section 9 -------------------------------------------------
 
@@ -115,8 +122,12 @@ class VehicleEstimator:
         # shape to gate on, so quality is the only filter available.
         if nominal is not None:
             if abs(obs.aspect / nominal - 1.0) > self.cfg.plate_aspect_tol:
+                self.reject["bad_aspect"] += 1
                 return False
-        return obs.quality >= self.cfg.plate_min_quality
+        if obs.quality < self.cfg.plate_min_quality:
+            self.reject["low_quality"] += 1
+            return False
+        return True
 
     # -- main entry point ---------------------------------------------------------------
 
@@ -139,10 +150,15 @@ class VehicleEstimator:
         if plate_ran:
             self._t_last_plate = t
             found = self.plate_locator.locate(gray, track.bbox)
-            if found is not None and self._plate_gate_ok(found):
-                plate = found
-                # MATH.md (8.1): every simultaneous sighting feeds the transfer.
-                self.kappa.add_pair(plate.w_px, w_big, cfg.kappa_plate)
+            if found is None:
+                self.reject["not_found"] += 1
+            else:
+                self.last_quality = found.quality
+                if self._plate_gate_ok(found):
+                    self.reject["ok"] += 1
+                    plate = found
+                    # MATH.md (8.1): every simultaneous sighting feeds the transfer.
+                    self.kappa.add_pair(plate.w_px, w_big, cfg.kappa_plate)
 
         # ---- 3. seed the filter ------------------------------------------------------
         if not self.ekf.initialised:

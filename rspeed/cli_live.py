@@ -195,9 +195,14 @@ def cmd_live(args: argparse.Namespace) -> int:
         feature_aspect=None,  # arbitrary object: no nominal shape to gate on
         q=args.q, detect_stride=1, plate_refresh_s=args.refresh_s,
         sigma_w_plate_px=args.sigma_w, sigma_w_bbox_px=args.sigma_w * 4.0,
+        # The 0.15 default is tuned for a high-contrast licence plate. An arbitrary
+        # hand-held object against a room background scores far lower and would be
+        # rejected outright, so live mode gates much more permissively.
+        plate_min_quality=args.min_quality,
     )
     maps = calib.undistort_maps() if (calib and any(calib.dist)) else None
-    session = LiveSession(cfg, KnownObjectLocator(), undistort_maps=maps)
+    session = LiveSession(cfg, KnownObjectLocator(min_quality=args.min_quality),
+                          undistort_maps=maps)
 
     print(f"\n{w}x{h}, f = {cfg.focal_px:.1f} px, target width {width_m * 100:.1f} cm")
     print("Drag a box around the object, then press ENTER or SPACE. ESC cancels.")
@@ -205,7 +210,29 @@ def cmd_live(args: argparse.Namespace) -> int:
 
     window = "relative speedometer -- live"
     frame = session.prepare(frame)
-    if not session.select_target(frame):
+
+    if args.auto:
+        # Pick a target without human input: the region whose measured width is most
+        # stable over a short burst. Same criterion the noise tool uses, and for the
+        # same reason -- contrast alone does not mean the fitter can track a width
+        # there. Lets the whole pipeline be exercised unattended.
+        from .noise import find_measurable_roi
+
+        burst = [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)]
+        for _ in range(11):
+            ok2, f2 = cap.read()
+            if ok2:
+                burst.append(cv2.cvtColor(session.prepare(f2), cv2.COLOR_BGR2GRAY))
+        found = find_measurable_roi(burst)
+        if found is None:
+            print("auto mode found no measurable region -- point the camera at an "
+                  "object with a clear vertical boundary", file=sys.stderr)
+            cap.release()
+            return 1
+        box, quality = found
+        print(f"auto-selected ROI {box} (edge quality {quality:.2f})")
+        session.set_target(frame, box)
+    elif not session.select_target(frame):
         print("no target selected", file=sys.stderr)
         cap.release()
         return 1
@@ -218,13 +245,21 @@ def cmd_live(args: argparse.Namespace) -> int:
             args.save, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h)
         )
 
+    import time as _time
+
+    t_start = _time.perf_counter()
+    trace: list = []
     try:
         while True:
+            if args.duration and (_time.perf_counter() - t_start) >= args.duration:
+                break
             ok, raw = cap.read()
             if not ok:
                 break
             frame = session.prepare(raw)
             est = session.step(frame)
+            if est is not None:
+                trace.append(est)
             vis = draw_live_overlay(frame, est, session.stats, cfg)
             if writer is not None:
                 writer.write(vis)
@@ -254,7 +289,84 @@ def cmd_live(args: argparse.Namespace) -> int:
         verdict = ("consistent" if 0.5 < m < 2.0 else
                    "OVERCONFIDENT - raise --q" if m >= 2.0 else "too loose - lower --q")
         print(f"mean NIS {m:.2f} ({verdict})")
+
+    if trace:
+        _summarise_trace(trace)
+    est_obj = session.estimator
+    if est_obj is not None and sum(est_obj.reject.values()):
+        r = est_obj.reject
+        print("\n--- Channel A attempts ---")
+        for k in ("ok", "not_found", "low_quality", "bad_aspect"):
+            if r.get(k):
+                print(f"  {k:<12} {r[k]}")
+        if r["ok"] == 0:
+            print("\n  Channel A never anchored, so there is no absolute scale and")
+            print("  range/speed stay unavailable. TTC is unaffected -- Channel B")
+            print("  needs no calibration.")
+            if r["low_quality"]:
+                q = est_obj.last_quality
+                print(f"  Cause: edge contrast below --min-quality "
+                      f"(last measured {q:.3f} vs {args.min_quality:.3f}).")
+                print("  Point at a higher-contrast target, or lower --min-quality.")
+            elif r["not_found"]:
+                print("  Cause: no opposing edge pair found in the target box at all.")
+                print("  The target needs a clear vertical boundary against its")
+                print("  background -- a card held up, not a flat wall.")
     return 0
+
+
+def _summarise_trace(trace: list) -> None:
+    """Report what each stage actually did over the run.
+
+    A single speed number tells you nothing about whether the machinery underneath it
+    worked. These counts are what distinguish a real measurement from a confident
+    guess: which channel anchored, whether registration ever landed, whether the kappa
+    transfer locked.
+    """
+    import numpy as np
+
+    n = len(trace)
+    ch_a = {}
+    for e in trace:
+        ch_a[e.channel_a] = ch_a.get(e.channel_a, 0) + 1
+    n_b = sum(1 for e in trace if e.channel_b)
+    n_cal = sum(1 for e in trace if e.calibrated)
+    n_lock = sum(1 for e in trace if e.kappa_locked)
+
+    print("\n--- pipeline behaviour over the run ---")
+    print(f"  frames estimated  : {n}")
+    print(f"  Channel A anchor  : " +
+          ", ".join(f"{k}={v} ({v / n:.0%})" for k, v in sorted(ch_a.items())))
+    print(f"  Channel B landed  : {n_b} ({n_b / n:.0%})")
+    print(f"  calibrated frames : {n_cal} ({n_cal / n:.0%})")
+    print(f"  kappa locked      : {n_lock} ({n_lock / n:.0%})")
+
+    scales = [e.scale for e in trace if e.scale is not None]
+    if scales:
+        ss = np.array([m.s for m in scales])
+        cc = np.array([m.confidence for m in scales])
+        print(f"  scale ratio       : mean {ss.mean():.5f}  "
+              f"spread {1.4826 * np.median(np.abs(ss - np.median(ss))):.5f}  "
+              f"confidence {cc.mean():.3f}")
+
+    widths = [e.plate.w_px for e in trace if e.plate is not None]
+    if widths:
+        wa = np.array(widths)
+        print(f"  measured width    : mean {wa.mean():.2f} px  "
+              f"sigma {1.4826 * np.median(np.abs(wa - np.median(wa))):.3f} px")
+
+    cal = [e for e in trace if e.calibrated and e.Z is not None]
+    if cal:
+        z = np.array([e.Z for e in cal])
+        v = np.array([e.Zdot for e in cal])
+        print(f"  range             : {z.min():.2f} .. {z.max():.2f} m "
+              f"(median {np.median(z):.2f})")
+        print(f"  relative speed    : {v.min() * 3.6:+.1f} .. {v.max() * 3.6:+.1f} km/h "
+              f"(median {np.median(v) * 3.6:+.1f})")
+        ttc = [e.ttc for e in cal if math.isfinite(e.ttc)]
+        if ttc:
+            print(f"  TTC (finite)      : {min(ttc):.2f} .. {max(ttc):.2f} s "
+                  f"({len(ttc)}/{len(cal)} frames closing)")
 
 
 # --- parser registration ----------------------------------------------------------------------
@@ -305,4 +417,136 @@ def register(sub: argparse._SubParsersAction) -> None:
     v.add_argument("--save", help="write an annotated mp4 here")
     v.add_argument("--force", action="store_true",
                    help="run even if the camera image is too dark to measure")
+    v.add_argument("--auto", action="store_true",
+                   help="pick the target automatically instead of asking you to drag "
+                        "a box; lets the pipeline run unattended")
+    v.add_argument("--duration", type=float,
+                   help="stop after this many seconds")
+    v.add_argument("--min-quality", type=float, default=0.02,
+                   help="edge-contrast floor for accepting a width measurement")
     v.set_defaults(func=cmd_live)
+
+    n = sub.add_parser("measure-noise",
+                       help="measure this camera's real sigma_w and sigma_s")
+    n.add_argument("--index", type=int, default=0)
+    n.add_argument("--width", type=int, default=1280)
+    n.add_argument("--height", type=int, default=720)
+    n.add_argument("--frames", type=int, default=120)
+    n.add_argument("--roi", help="x,y,w,h to measure; default picks the best region")
+    n.add_argument("--focal", type=float, help="fx in px, for the implied-error table")
+    n.add_argument("--hfov", type=float, default=60.0)
+    n.add_argument("--force", action="store_true",
+                   help="run even if the image looks unmeasurable")
+    n.set_defaults(func=cmd_measure_noise)
+
+
+# --- measure-noise ------------------------------------------------------------------------------
+
+
+def cmd_measure_noise(args: argparse.Namespace) -> int:
+    """Measure this camera's real sigma_w and sigma_s -- MATH.md section 10.
+
+    These two numbers set the accuracy of everything the project reports, and the
+    config defaults are placeholders. This replaces them with measurements.
+    """
+    import time
+
+    from .geometry import focal_length_px
+    from .noise import measure_noise
+
+    try:
+        cap = open_camera(args.index, args.width, args.height)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    ok, first = cap.read()
+    if not ok:
+        print("camera delivered no frames", file=sys.stderr)
+        cap.release()
+        return 2
+
+    rep0 = exposure_report(first)
+    print(f"camera {args.index}: {first.shape[1]}x{first.shape[0]}, "
+          f"mean level {rep0['mean']:.1f}, {rep0['verdict']}")
+    if not rep0["usable"] and not args.force:
+        print("image is not measurable; fix lighting first (or pass --force)",
+              file=sys.stderr)
+        cap.release()
+        return 2
+
+    print(f"\nHold the camera STILL and keep the scene static for "
+          f"{args.frames} frames.")
+    print("Point it at something with clear vertical edges -- a book spine, a box, a")
+    print("card propped up. Motion during capture inflates the measured noise.\n")
+
+    frames = []
+    t0 = time.perf_counter()
+    while len(frames) < args.frames:
+        ok, f = cap.read()
+        if not ok:
+            break
+        frames.append(f)
+    elapsed = time.perf_counter() - t0
+    cap.release()
+    fps = len(frames) / elapsed if elapsed > 0 else 0.0
+
+    roi = None
+    if args.roi:
+        try:
+            roi = tuple(int(v) for v in args.roi.split(","))
+            if len(roi) != 4:
+                raise ValueError
+        except ValueError:
+            print("--roi must be x,y,w,h", file=sys.stderr)
+            return 2
+
+    report = measure_noise(frames, roi=roi, measured_fps=fps)
+    if report is None:
+        print("\nCould not find any region whose edges are measurable.")
+        print("Point the camera at an object with a clear vertical boundary against")
+        print("its background, then retry.")
+        return 1
+
+    print(f"captured {report.n_frames} frames at {fps:.1f} fps")
+    print(f"scene motion: {report.motion_px:.2f} px/frame  "
+          f"({'STATIONARY' if report.stationary else 'MOVING -- results inflated'})")
+    print(f"ROI used: {report.roi}  (edge quality {report.mean_quality:.2f})")
+
+    print("\n--- measured noise ---")
+    if math.isnan(report.sigma_w_px):
+        print(f"  width: only {report.n_width} usable frames, cannot estimate")
+    else:
+        print(f"  mean width      : {report.mean_w_px:8.2f} px "
+              f"({report.n_width}/{report.n_frames} frames measured)")
+        rel = report.sigma_w_px / max(report.mean_w_px, 1e-6)
+        print(f"  sigma_w         : {report.sigma_w_px:8.3f} px   "
+              f"-> config.sigma_w_plate_px")
+        print(f"  relative        : {rel:8.1%}      "
+              f"({'ok' if rel < 0.05 else 'TOO HIGH -- not a stable feature'})")
+        print(f"  stable frames   : {report.stable_frac:8.1%}")
+        if rel >= 0.05:
+            print("\n  A sigma this large is not sensor noise. The edge fitter is")
+            print("  locking onto different feature pairs between frames, so the width")
+            print("  jumps rather than fluctuating. Point the camera at ONE object with")
+            print("  a clean vertical boundary and plain background, or pass --roi.")
+    if math.isnan(report.sigma_s):
+        print(f"  scale: only {report.n_scale} usable registrations, cannot estimate")
+    else:
+        print(f"  sigma_s         : {report.sigma_s:8.5f}      -> config.sigma_s_base")
+        print(f"  scale bias      : {report.scale_bias:+8.5f}      "
+              f"(should be ~0 on a static scene)")
+
+    if not math.isnan(report.sigma_w_px):
+        f_px = args.focal or focal_length_px(first.shape[1], args.hfov)
+        print(f"\n--- what that means, at f = {f_px:.0f} px, EU plate ---")
+        print(f"{'range':>8} {'sigma_v':>12}")
+        for Z in (10.0, 20.0, 30.0, 40.0):
+            sv = report.implied_speed_noise(f_px, 0.520, Z)
+            print(f"{Z:7.0f}m {sv:8.2f} m/s  ({sv * 3.6:5.1f} km/h)")
+        print("\n(naive differentiation; the EKF does better. MATH.md section 3.)")
+
+    if not report.stationary:
+        print("\nThe scene was MOVING, so these sigmas include real motion and are")
+        print("too large. Prop the camera up and rerun for a valid measurement.")
+    return 0 if report.usable else 1

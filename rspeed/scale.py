@@ -68,6 +68,7 @@ class ScaleEstimator:
         sigma_s_base: float = 0.004,
         ecc_iterations: int = 40,
         ecc_eps: float = 1e-5,
+        taper: bool = False,
     ):
         """
         Args:
@@ -79,6 +80,25 @@ class ScaleEstimator:
                 from MATH.md 5.3.
             sigma_s_base: baseline 1-sigma on the recovered scale ratio. Measure this
                 for your camera per MATH.md section 10 rather than trusting the default.
+            taper: apply a Hann window to each patch before registration.
+                DEFAULT OFF, and it should stay off -- kept only because the reasoning
+                is worth recording.
+
+                The motivation was real: on live footage the scene drifts slowly, so
+                content slides into and out of the fixed window and the 6-DOF affine
+                fit absorbs that edge content as apparent scale. On a static real scene
+                the taper did cut the bias from +0.0025 to -0.0001.
+
+                But it is wrong, because a fixed window is not scale-equivariant. When
+                the content scales the window does not, so it behaves as fixed
+                structure that drags the estimate toward s = 1. Measured against a
+                known synthetic scaling it recovered 1.0868 for a true 1.1111 -- a 22%
+                under-report of the excess scale, which would under-report speed by
+                about the same. That is far worse than the bias it removed.
+
+                The border-content problem is better handled where it originates:
+                keeping the ROI away from the frame edge, and re-anchoring on the
+                MATH.md 5.3 policy rather than holding one ever-growing baseline.
         """
         self.canonical = int(canonical)
         self.roi_factor = float(roi_factor)
@@ -95,6 +115,10 @@ class ScaleEstimator:
         )
         self._kf: _Keyframe | None = None
         self.reanchor_count = 0
+        self._window: np.ndarray | None = None
+        if taper:
+            n = self.canonical
+            self._window = np.outer(np.hanning(n), np.hanning(n)).astype(np.float32)
 
     # -- public API -------------------------------------------------------------------
 
@@ -278,4 +302,9 @@ class ScaleEstimator:
         mean, std = float(patch.mean()), float(patch.std())
         if std > 1e-6:
             patch = (patch - mean) / std
+        if self._window is not None:
+            # Down-weight the border, where content enters and leaves as the scene
+            # drifts. Applied after normalisation so the taper shapes contrast, not
+            # absolute level.
+            patch = patch * self._window
         return np.ascontiguousarray(patch, dtype=np.float32)

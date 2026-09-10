@@ -1,8 +1,13 @@
 # Core -- the measurement mathematics needs only these.
 numpy>=1.24
 opencv-python>=4.8
-scipy>=1.10
 
-# Optional: real-video vehicle detection. Everything except `main.py video`
-# works without it, including the full test suite against synthetic ground truth.
+# NOTE: it must be opencv-python, NOT opencv-python-headless. The headless build
+# reports GUI: NONE and every window call raises "The function is not implemented",
+# which breaks `live` (cv2.selectROI / imshow) even though the maths is unaffected.
+# scipy was listed here originally and is not imported anywhere; dropped, which also
+# removes a spurious numpy-2.x incompatibility warning.
+
+# Optional: real-video vehicle detection. Everything else works without it,
+# including the full test suite against synthetic ground truth.
 # ultralytics>=8.3

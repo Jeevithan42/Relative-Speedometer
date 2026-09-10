@@ -1,0 +1,18 @@
+{
+  "fx": 980.952380952381,
+  "fy": 980.952380952381,
+  "cx": 640.0,
+  "cy": 360.0,
+  "dist": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "image_width": 1280,
+  "image_height": 720,
+  "rms_reproj_error": 0.0,
+  "method": "known-object (a4-portrait, 1.00 m, corrected from a4-landscape)",
+  "n_views": 1
+}
