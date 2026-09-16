@@ -24,7 +24,9 @@ from .camera import (
     probe_modes,
 )
 from .config import Config
+from .geometry import focal_length_px
 from .live import KNOWN_OBJECTS_M, LiveSession, draw_live_overlay
+from .noise import DEFAULT_NOISE_PROFILE, NoiseProfile
 from .plate import KnownObjectLocator
 
 DEFAULT_CALIB = "calibration.json"
@@ -127,6 +129,93 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def default_resolution(args: argparse.Namespace) -> tuple[int, int]:
+    """Explicit --width/--height, else the calibration's resolution, else 1280x720.
+
+    Defaulting to the calibrated mode is what keeps fx valid: a calibration is only
+    exact at the resolution it was measured at (Calibration.focal_for).
+    """
+    if args.width and args.height:
+        return int(args.width), int(args.height)
+    calib_path = getattr(args, "calib", None)
+    if calib_path and Path(calib_path).exists() and not getattr(args, "focal", None):
+        c = Calibration.load(calib_path)
+        return int(args.width or c.image_width), int(args.height or c.image_height)
+    return int(args.width or 1280), int(args.height or 720)
+
+
+def resolve_intrinsics(
+    args: argparse.Namespace, width: int, height: int
+) -> tuple[float, Calibration | None]:
+    """fx for the frames actually delivered: --focal, else a calibration valid at this
+    resolution, else the --hfov guess (loudly). Returns (fx, calibration if exact).
+
+    Resolved against the *delivered* frame size, not the requested one -- a camera that
+    silently falls back to another mode must not keep the old mode's fx.
+    """
+    if getattr(args, "focal", None):
+        print(f"intrinsics: f = {args.focal:.1f} px from --focal")
+        return float(args.focal), None
+
+    reason = "no calibration file and no --focal"
+    calib_path = getattr(args, "calib", None)
+    if calib_path and Path(calib_path).exists():
+        calib = Calibration.load(calib_path)
+        fx, how = calib.focal_for(width, height)
+        if fx is not None:
+            print(f"calibration: {calib.summary()}")
+            print(f"intrinsics: f = {fx:.1f} px at {width}x{height} ({how})")
+            return fx, (calib if how == "exact" else None)
+        reason = f"{calib_path} not usable: {how}"
+
+    f = focal_length_px(width, args.hfov)
+    print(f"WARNING: {reason}.")
+    print(f"         Falling back to --hfov {args.hfov:g} deg -> f = {f:.1f} px. That is a")
+    print("         guess and every range inherits its error. TTC is unaffected. Fix with:")
+    print("         python main.py calibrate --method quick --object card --distance 0.5")
+    return f, None
+
+
+def resolve_noise(args: argparse.Namespace, width: int, height: int) -> tuple[float, float]:
+    """(sigma_w_px, sigma_s): explicit flags, else the measured profile, else defaults."""
+    base = Config()
+    sigma_w = base.sigma_w_plate_px
+    sigma_s = base.sigma_s_base
+    source = "config defaults (not measured on this camera)"
+
+    path = getattr(args, "noise", None)
+    if path and Path(path).exists():
+        profile = NoiseProfile.load(path)
+        if profile.matches(width, height):
+            sigma_w, sigma_s = profile.sigma_w_px, profile.sigma_s
+            source = f"{path}: {profile.summary()}"
+        else:
+            source = (f"config defaults ({path} was measured at "
+                      f"{profile.image_width}x{profile.image_height}, frames are "
+                      f"{width}x{height})")
+
+    if getattr(args, "sigma_w", None) is not None:
+        sigma_w = float(args.sigma_w)
+        source += "; sigma_w from --sigma-w"
+    if getattr(args, "sigma_s", None) is not None:
+        sigma_s = float(args.sigma_s)
+        source += "; sigma_s from --sigma-s"
+    print(f"noise: sigma_w={sigma_w:.3f}px sigma_s={sigma_s:.5f}  <- {source}")
+    return sigma_w, sigma_s
+
+
+def add_camera_model_args(p: argparse.ArgumentParser) -> None:
+    """Intrinsics and noise flags shared by every command that measures."""
+    p.add_argument("--calib", default=DEFAULT_CALIB,
+                   help="calibration file; used only if valid at the frame resolution")
+    p.add_argument("--focal", type=float, help="fx in px, overrides --calib and --hfov")
+    p.add_argument("--hfov", type=float, default=60.0, help="last-resort guess for fx")
+    p.add_argument("--noise", default=DEFAULT_NOISE_PROFILE,
+                   help="noise profile written by measure-noise")
+    p.add_argument("--sigma-w", type=float, help="width noise px, overrides --noise")
+    p.add_argument("--sigma-s", type=float, help="scale-ratio noise, overrides --noise")
+
+
 def _resolve_width(args: argparse.Namespace) -> float | None:
     if getattr(args, "object", None):
         return KNOWN_OBJECTS_M[args.object]
@@ -151,19 +240,9 @@ def cmd_live(args: argparse.Namespace) -> int:
             return 2
         width_m = 0.1  # placeholder; nothing absolute is trustworthy in this mode
 
-    calib = None
-    if args.calib and Path(args.calib).exists():
-        calib = Calibration.load(args.calib)
-        print(f"calibration: {calib.summary()}")
-    elif not args.focal:
-        print(f"WARNING: no calibration file and no --focal, so falling back to "
-              f"--hfov ({args.hfov:g} deg).")
-        print("         That is a guess and every range inherits its error. Fix with:")
-        print("         python main.py calibrate --method quick --object card "
-              "--distance 0.5")
-
+    req_w, req_h = default_resolution(args)
     try:
-        cap = open_camera(args.index, args.width, args.height)
+        cap = open_camera(args.index, req_w, req_h)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -187,14 +266,16 @@ def cmd_live(args: argparse.Namespace) -> int:
             return 2
         print("  --force given, continuing anyway.\n")
 
+    f_px, calib = resolve_intrinsics(args, w, h)
+    sigma_w, sigma_s = resolve_noise(args, w, h)
     cfg = Config(
         image_width=w, image_height=h, hfov_deg=args.hfov,
-        f_px=(calib.fx if calib else args.focal),
+        f_px=f_px,
         fps=args.fps,
         feature_width_m=width_m,
         feature_aspect=None,  # arbitrary object: no nominal shape to gate on
         q=args.q, detect_stride=1, plate_refresh_s=args.refresh_s,
-        sigma_w_plate_px=args.sigma_w, sigma_w_bbox_px=args.sigma_w * 4.0,
+        sigma_w_plate_px=sigma_w, sigma_w_bbox_px=sigma_w * 4.0, sigma_s_base=sigma_s,
         # The 0.15 default is tuned for a high-contrast licence plate. An arbitrary
         # hand-held object against a room background scores far lower and would be
         # rejected outright, so live mode gates much more permissively.
@@ -283,7 +364,7 @@ def cmd_live(args: argparse.Namespace) -> int:
 
     st = session.stats
     print(f"\n{st.frames} frames at {st.measured_fps:.1f} fps measured, "
-          f"{st.tracker_failures} tracker failures")
+          f"{st.ms_per_frame:.1f} ms/frame processing, {st.lost_frames} frames target lost")
     if session.estimator is not None and not math.isnan(session.estimator.mean_nis):
         m = session.estimator.mean_nis
         verdict = ("consistent" if 0.5 < m < 2.0 else
@@ -296,7 +377,7 @@ def cmd_live(args: argparse.Namespace) -> int:
     if est_obj is not None and sum(est_obj.reject.values()):
         r = est_obj.reject
         print("\n--- Channel A attempts ---")
-        for k in ("ok", "not_found", "low_quality", "bad_aspect"):
+        for k in ("ok", "not_found", "too_small", "low_quality", "bad_aspect", "gated"):
             if r.get(k):
                 print(f"  {k:<12} {r[k]}")
         if r["ok"] == 0:
@@ -384,8 +465,9 @@ def register(sub: argparse._SubParsersAction) -> None:
                    help="quick: one known object at a measured distance. "
                         "checkerboard: proper, also gives distortion")
     k.add_argument("--index", type=int, default=0)
-    k.add_argument("--width", type=int, default=640)
-    k.add_argument("--height", type=int, default=480)
+    k.add_argument("--width", type=int, default=1280,
+                   help="calibrate at the resolution you will measure at -- fx is per mode")
+    k.add_argument("--height", type=int, default=720)
     k.add_argument("--out", default=DEFAULT_CALIB)
     k.add_argument("--object", choices=sorted(KNOWN_OBJECTS_M),
                    help="a known object (quick method)")
@@ -399,20 +481,18 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     v = sub.add_parser("live", help="measure a known-size object with your camera")
     v.add_argument("--index", type=int, default=0)
-    v.add_argument("--width", type=int, default=640)
-    v.add_argument("--height", type=int, default=480)
+    v.add_argument("--width", type=int,
+                   help="default: the calibration's resolution, else 1280")
+    v.add_argument("--height", type=int, help="default: the calibration's, else 720")
     v.add_argument("--fps", type=float, default=30.0, help="only used for --save")
     v.add_argument("--object", choices=sorted(KNOWN_OBJECTS_M))
     v.add_argument("--object-width", type=float, help="target width in metres")
     v.add_argument("--ttc-only", action="store_true",
                    help="run without a known width: TTC only, no absolute range")
-    v.add_argument("--calib", default=DEFAULT_CALIB)
-    v.add_argument("--focal", type=float, help="fx in px, overrides --hfov")
-    v.add_argument("--hfov", type=float, default=60.0)
+    add_camera_model_args(v)
     v.add_argument("--q", type=float, default=0.05,
                    help="process noise; hand-held targets manoeuvre hard, so this is "
                         "looser than the on-road default")
-    v.add_argument("--sigma-w", type=float, default=0.5, help="width noise, px")
     v.add_argument("--refresh-s", type=float, default=0.5)
     v.add_argument("--save", help="write an annotated mp4 here")
     v.add_argument("--force", action="store_true",
@@ -437,6 +517,9 @@ def register(sub: argparse._SubParsersAction) -> None:
     n.add_argument("--hfov", type=float, default=60.0)
     n.add_argument("--force", action="store_true",
                    help="run even if the image looks unmeasurable")
+    n.add_argument("--out", default=DEFAULT_NOISE_PROFILE,
+                   help="write the measured profile here when the capture was valid; "
+                        "live and video read it")
     n.set_defaults(func=cmd_measure_noise)
 
 
@@ -549,4 +632,9 @@ def cmd_measure_noise(args: argparse.Namespace) -> int:
     if not report.stationary:
         print("\nThe scene was MOVING, so these sigmas include real motion and are")
         print("too large. Prop the camera up and rerun for a valid measurement.")
+    if report.usable and args.out:
+        report.to_profile(first.shape[1], first.shape[0]).save(args.out)
+        print(f"\nsaved noise profile to {args.out} -- live and video will use it")
+    elif args.out:
+        print(f"\nnot saving {args.out}: the capture was not valid enough to trust")
     return 0 if report.usable else 1

@@ -46,56 +46,30 @@ KNOWN_OBJECTS_M = {
 class LiveStats:
     frames: int = 0
     measured_fps: float = 0.0
-    tracker_failures: int = 0
+    lost_frames: int = 0  # frames on which registration could not place the target
+    ms_per_frame: float = 0.0  # processing cost, excluding capture and display
 
 
 class ManualTarget:
-    """A user-selected ROI followed by an OpenCV tracker.
+    """A user-selected box, moved frame to frame by Channel B's own registration.
 
-    The tracker only has to keep the ROI roughly *centred*: Channel B freezes its ROI
-    size with each keyframe and recovers scale by registration, so tracker box jitter
-    does not enter the velocity estimate at all. Channel A does use the box, but only
-    as a bracket -- the width it consumes comes from subpixel edge refinement.
+    There is no separate tracker. The ECC warp that yields the scale ratio also yields
+    where the keyframe's anchor now sits (MATH.md 5.4), and the estimator moves the box
+    with it. That replaced TrackerMIL, which cost ~110-140 ms/frame -- over 90% of the
+    whole live loop -- and never changed its box size, so the plate bracket drifted off
+    any target whose distance was actually changing.
     """
 
-    def __init__(
-        self,
-        frame: np.ndarray,
-        bbox: tuple[int, int, int, int],
-        use_tracker: bool = True,
-    ):
-        """`use_tracker=False` keeps the box under external control -- used by tests
+    def __init__(self, bbox: tuple[int, int, int, int], tracked: bool = True):
+        """`tracked=False` keeps the box under external control -- used by tests
         driving known trajectories, and by anyone feeding boxes from their own
-        detector."""
+        detector. Such a box counts as a measurement; a tracked one does not."""
         self.bbox = tuple(int(v) for v in bbox)
-        self._tracker = self._make_tracker() if use_tracker else None
-        self._ok = True
-        if self._tracker is not None:
-            self._tracker.init(frame, self.bbox)
-
-    @staticmethod
-    def _make_tracker():
-        # CSRT/KCF live in opencv-contrib and are often absent; MIL ships with the base
-        # package. MIL is slower and drifts more, which is tolerable here for the
-        # reason in the class docstring.
-        for name in ("TrackerCSRT_create", "TrackerKCF_create", "TrackerMIL_create"):
-            fn = getattr(cv2, name, None)
-            if fn is not None:
-                return fn()
-        return None
+        self.tracked = bool(tracked)
 
     @property
     def tracker_name(self) -> str:
-        return type(self._tracker).__name__ if self._tracker else "none (static ROI)"
-
-    def update(self, frame: np.ndarray) -> bool:
-        if self._tracker is None:
-            return True  # static ROI fallback
-        ok, box = self._tracker.update(frame)
-        if ok:
-            self.bbox = tuple(int(v) for v in box)
-        self._ok = bool(ok)
-        return self._ok
+        return "ECC registration (Channel B)" if self.tracked else "none (external box)"
 
     def as_track(self, track_id: int = 1) -> Track:
         x, y, w, h = self.bbox
@@ -135,8 +109,7 @@ class LiveSession:
         cv2.destroyWindow(window)
         if box is None or box[2] < 8 or box[3] < 8:
             return False
-        self.target = ManualTarget(frame, box)
-        self.estimator = VehicleEstimator(1, self.cfg, self.locator)
+        self.set_target(frame, box)
         return True
 
     def set_target(
@@ -145,9 +118,14 @@ class LiveSession:
         bbox: tuple[int, int, int, int],
         use_tracker: bool = True,
     ) -> None:
-        """Non-interactive target selection, for scripted tests and external detectors."""
-        self.target = ManualTarget(frame, bbox, use_tracker=use_tracker)
+        """Non-interactive target selection, for scripted tests and external detectors.
+
+        `frame` is unused now that tracking needs no initialisation image; it is kept so
+        callers written against the tracker-based API still work.
+        """
+        self.target = ManualTarget(bbox, tracked=use_tracker)
         self.estimator = VehicleEstimator(1, self.cfg, self.locator)
+        self._t0 = None
 
     def reset(self) -> None:
         self.target = None
@@ -171,13 +149,19 @@ class LiveSession:
         if t is None:
             t = now - self._t0
 
-        if not self.target.update(frame):
-            self.stats.tracker_failures += 1
-
+        t_work = time.perf_counter()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        est = self.estimator.update(gray, self.target.as_track(), t)
+        track = self.target.as_track()
+        est = self.estimator.update(gray, track, t, box_measured=not self.target.tracked)
+        self.target.bbox = track.bbox  # the estimator moved it when tracking
+        if not est.tracking_ok:
+            self.stats.lost_frames += 1
 
         self.stats.frames += 1
+        work_ms = (time.perf_counter() - t_work) * 1000.0
+        # Exponential average: responsive, and not dominated by a slow first frame.
+        a = 0.1 if self.stats.frames > 1 else 1.0
+        self.stats.ms_per_frame += a * (work_ms - self.stats.ms_per_frame)
         elapsed = now - self._t0
         if elapsed > 0:
             self.stats.measured_fps = self.stats.frames / elapsed
@@ -202,6 +186,11 @@ def draw_live_overlay(
         return out
 
     x, y, bw, bh = est.bbox
+    if not est.tracking_ok:
+        cv2.rectangle(out, (x, y), (x + bw, y + bh), (70, 70, 240), 1)
+        cv2.putText(out, "TARGET LOST -- press S to reselect", (16, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (70, 70, 240), 2, cv2.LINE_AA)
+        return out
     closing = est.Zdot is not None and est.Zdot < 0
     colour = (70, 70, 240) if (math.isfinite(est.ttc) and est.ttc < 3.0) else (
         (60, 190, 240) if closing else (90, 220, 110))
@@ -232,7 +221,7 @@ def draw_live_overlay(
         f"A:{est.channel_a}  B:{'yes' if est.channel_b else 'no'}",
         f"kappa {'locked' if est.kappa_locked else f'open n={est.kappa_samples}'}",
         f"W={cfg.plate_width_m * 100:.1f}cm  f={cfg.focal_px:.0f}px",
-        f"{stats.measured_fps:.1f} fps",
+        f"{stats.measured_fps:.1f} fps  ({stats.ms_per_frame:.1f} ms processing)",
     ]
     if est.scale is not None:
         diag.append(f"s={est.scale.s:.4f} dt={est.scale.dtau:.2f}s cc={est.scale.confidence:.2f}")

@@ -15,6 +15,11 @@ Keyframe policy (MATH.md 5.3): register against a held reference frame rather th
 the previous frame, so registration error does not accumulate. The ROI pixel size is
 frozen for the lifetime of a keyframe, which means the measured canonical scale IS
 the true scale -- no bounding-box jitter leaks into Channel B.
+
+Tracking for free (MATH.md 5.4): the affine warp that yields `s` also contains a
+translation. Solving it for where the keyframe's anchor point sits in the current frame
+gives a subpixel target position, so no separate tracker is needed. This replaced
+TrackerMIL, which cost ~110-140 ms/frame and never changed its box size.
 """
 
 from __future__ import annotations
@@ -43,6 +48,9 @@ class ScaleMeasurement:
     confidence: float  # registration quality in [0, 1]
     sigma_s: float  # 1-sigma uncertainty on s
     backend: str
+    # Where the keyframe's anchor point lies in the current frame, full-frame pixels.
+    # None when the backend cannot supply it (log-polar assumes a centred target).
+    center: tuple[float, float] | None = None
 
 
 @dataclass
@@ -50,7 +58,8 @@ class _Keyframe:
     patch: np.ndarray  # canonical-size float32 grayscale
     t: float
     roi_size: int  # frozen for the keyframe's lifetime -- see module docstring
-    center: tuple[float, float]
+    center: tuple[float, float]  # anchor point, clamped into the frame
+    origin: tuple[int, int]  # top-left of the crop in full-frame pixels
 
 
 class ScaleEstimator:
@@ -126,6 +135,11 @@ class ScaleEstimator:
     def has_keyframe(self) -> bool:
         return self._kf is not None
 
+    @property
+    def anchor_center(self) -> tuple[float, float] | None:
+        """The keyframe's anchor point in its own frame, after clamping into the image."""
+        return None if self._kf is None else self._kf.center
+
     def anchor(
         self,
         gray: np.ndarray,
@@ -135,14 +149,17 @@ class ScaleEstimator:
     ) -> None:
         """Drop a new reference keyframe at the current frame."""
         roi = int(np.clip(round(self.roi_factor * feature_w_px), self.roi_min, self.roi_max))
-        patch = self._extract(gray, center, roi)
-        self._kf = _Keyframe(patch=patch, t=t, roi_size=roi, center=center)
+        patch, origin, clamped = self._extract_at(gray, center, roi)
+        self._kf = _Keyframe(patch=patch, t=t, roi_size=roi, center=clamped, origin=origin)
         self.reanchor_count += 1
 
     def measure(
         self, gray: np.ndarray, center: tuple[float, float], t: float
     ) -> ScaleMeasurement | None:
         """Register the current frame against the keyframe and return the scale ratio.
+
+        `center` is only where to look -- the best current guess of the anchor point.
+        The measurement's own `center` is where the anchor point actually is.
 
         Returns None when there is no keyframe, the baseline is degenerate, or
         registration failed. Callers should re-anchor on None.
@@ -156,14 +173,18 @@ class ScaleEstimator:
 
         # ROI size is frozen with the keyframe, so the canonical-space scale is the
         # true scale -- no resample-factor correction needed, and no bbox jitter.
-        cur = self._extract(gray, center, kf.roi_size)
+        cur, origin, _clamped = self._extract_at(gray, center, kf.roi_size)
 
-        result = self._register_ecc(kf.patch, cur)
-        if result is None:
+        located: tuple[float, float] | None = None
+        ecc = self._register_ecc(kf.patch, cur)
+        if ecc is None:
             result = self._register_logpolar(kf.patch, cur)
             backend = "logpolar"
         else:
+            s_ecc, cc, warp = ecc
+            result = (s_ecc, cc)
             backend = "ecc"
+            located = self._locate(kf, origin, warp)
         if result is None:
             return None
 
@@ -176,7 +197,8 @@ class ScaleEstimator:
         sigma_s = self.sigma_s_base * (1.0 + 4.0 * max(0.0, 1.0 - confidence))
 
         return ScaleMeasurement(
-            s=s, dtau=dtau, confidence=confidence, sigma_s=sigma_s, backend=backend
+            s=s, dtau=dtau, confidence=confidence, sigma_s=sigma_s, backend=backend,
+            center=located,
         )
 
     def should_reanchor(self, m: ScaleMeasurement | None, t: float) -> bool:
@@ -197,9 +219,20 @@ class ScaleEstimator:
 
     def _register_ecc(
         self, ref: np.ndarray, cur: np.ndarray
-    ) -> tuple[float, float] | None:
-        """Affine ECC registration. Returns (scale, correlation) or None on failure."""
+    ) -> tuple[float, float, np.ndarray] | None:
+        """Affine ECC registration. Returns (scale, correlation, warp) or None on failure.
+
+        ECC is a local optimiser and only converges from within a fraction of the
+        patch, so when the target has moved, phase correlation seeds the translation
+        first. It is skipped for sub-pixel shifts, leaving a static scene registered
+        exactly as it was when sigma_s was measured.
+        """
         warp = np.eye(2, 3, dtype=np.float32)
+        (dx, dy), _response = cv2.phaseCorrelate(ref, cur)
+        if math.isfinite(dx) and math.isfinite(dy) and math.hypot(dx, dy) > 0.5:
+            # phaseCorrelate reports cur's content shifted by +d relative to ref, and
+            # the warp maps cur -> ref coordinates, so it starts at -d.
+            warp[0, 2], warp[1, 2] = -dx, -dy
         try:
             cc, warp = cv2.findTransformECC(
                 cur,  # templateImage
@@ -223,7 +256,34 @@ class ScaleEstimator:
         # affine model absorbs from perspective change.
         s_warp = math.sqrt(det)
         s = (1.0 / s_warp) if _ECC_SCALE_IS_INVERSE else s_warp
-        return s, float(np.clip(cc, 0.0, 1.0))
+        return s, float(np.clip(cc, 0.0, 1.0)), warp
+
+    def _locate(
+        self, kf: _Keyframe, origin: tuple[int, int] | None, warp: np.ndarray
+    ) -> tuple[float, float] | None:
+        """Where the keyframe's anchor point lies in the current frame.  MATH.md 5.4
+
+        The warp maps current-patch coordinates to keyframe-patch coordinates,
+        u_ref = A*u_cur + b, so the anchor is u_cur = A^-1 (u_ref - b). Each patch
+        pixel covers k = roi/canonical frame pixels, with pixel centres at integers:
+            p = origin + (u + 0.5)*k - 0.5
+        Registering against the keyframe rather than the previous frame means this
+        does not accumulate drift between re-anchors.
+        """
+        if origin is None:
+            return None
+        k = kf.roi_size / float(self.canonical)
+        A = warp[:, :2].astype(float)
+        b = warp[:, 2].astype(float)
+        u_ref = (np.asarray(kf.center, float) + 0.5 - np.asarray(kf.origin, float)) / k - 0.5
+        try:
+            u_cur = np.linalg.solve(A, u_ref - b)
+        except np.linalg.LinAlgError:
+            return None
+        p = np.asarray(origin, float) + (u_cur + 0.5) * k - 0.5
+        if not np.all(np.isfinite(p)):
+            return None
+        return float(p[0]), float(p[1])
 
     def _register_logpolar(
         self, ref: np.ndarray, cur: np.ndarray
@@ -259,10 +319,17 @@ class ScaleEstimator:
     def _extract(
         self, gray: np.ndarray, center: tuple[float, float], roi: int
     ) -> np.ndarray:
+        return self._extract_at(gray, center, roi)[0]
+
+    def _extract_at(
+        self, gray: np.ndarray, center: tuple[float, float], roi: int
+    ) -> tuple[np.ndarray, tuple[int, int] | None, tuple[float, float]]:
         """Crop a square ROI (replicate-padded at the borders) and resample to canonical.
 
-        Returns float32 in [0, 1]; ECC wants float input and is happier with a
-        normalised range.
+        Returns (patch, crop origin, clamped centre). The patch is zero-mean,
+        unit-variance float32; ECC wants float input and converges more reliably on a
+        normalised range. The origin is None if the crop had to fall back to the whole
+        frame, since patch coordinates then no longer map to frame pixels.
         """
         h, w = gray.shape[:2]
         cx, cy = center
@@ -281,10 +348,12 @@ class ScaleEstimator:
         xs0, ys0 = max(0, x0), max(0, y0)
         xs1, ys1 = min(w, x1), min(h, y1)
 
+        origin: tuple[int, int] | None = (x0, y0)
         crop = gray[ys0:ys1, xs0:xs1]
         if crop.size == 0:
             # Degenerate window: fall back to the whole frame rather than throwing.
             crop, pad_l, pad_t, pad_r, pad_b = gray, 0, 0, 0, 0
+            origin = None
         if pad_l or pad_t or pad_r or pad_b:
             crop = cv2.copyMakeBorder(
                 crop, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_REPLICATE
@@ -307,4 +376,4 @@ class ScaleEstimator:
             # drifts. Applied after normalisation so the taper shapes contrast, not
             # absolute level.
             patch = patch * self._window
-        return np.ascontiguousarray(patch, dtype=np.float32)
+        return np.ascontiguousarray(patch, dtype=np.float32), origin, (cx, cy)

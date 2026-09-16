@@ -163,6 +163,87 @@ def test_taper_must_not_be_enabled_by_default():
     assert ScaleEstimator()._window is None, "taper must default to off"
 
 
+def test_registration_locates_moved_target():
+    """MATH.md 5.4: the warp's translation must place the anchor to subpixel accuracy.
+
+    The target is shifted by a known amount AND scaled, and registration is started
+    from the stale position -- exactly the tracking case. Includes a 60 px jump, which
+    ECC alone does not converge from; phase correlation seeds it.
+    """
+    import cv2
+
+    f = focal_length_px(1280, 60.0)
+    seq = synth.SyntheticSequence(f_px=f, image_width=1280, image_height=720)
+    img_a, (x, y, w, h), _wp, _wc = seq.render(20.0, 0.0)
+    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
+    anchor = (x + w / 2.0, y + h * 0.70)
+
+    for dx, dy, Z in ((6.3, -2.2, 20.0), (25.0, 0.0, 18.0), (-40.0, 10.0, 20.0), (60.0, -15.0, 19.0)):
+        img_b, _box, _wp, _wc = seq.render(Z, 0.1)
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        img_b = cv2.warpAffine(img_b, M, (1280, 720), borderMode=cv2.BORDER_REPLICATE)
+        est = ScaleEstimator(roi_factor=1.4)
+        est.anchor(gray_a, anchor, float(w), 0.0)
+        m = est.measure(cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY), anchor, 0.1)
+        assert m is not None and m.center is not None, (dx, dy)
+        # Truth: the anchor scales about the synthetic horizon row, then shifts.
+        hc = f * 1.45 / Z
+        true_x = 640.0 + dx
+        true_y = 0.46 * 720 + hc * 0.55 - hc + 0.70 * hc + dy
+        # y carries the integer rounding of the initial box (~0.3 px), x does not
+        assert abs(m.center[0] - true_x) < 0.5, (dx, dy, m.center, true_x)
+        assert abs(m.center[1] - true_y) < 0.8, (dx, dy, m.center, true_y)
+        assert abs(m.s - 20.0 / Z) < 0.01, (m.s, 20.0 / Z)
+
+
+def test_estimator_tracks_target_with_no_detector():
+    """Between detections the box must follow the target, not sit where it was.
+
+    Only frame 0 has a measured box. Every later frame hands the estimator the stale
+    box; with lateral jitter of several pixels per frame plus a steady approach, the
+    propagated box has to stay on the car.
+    """
+    import cv2
+
+    from rspeed.detector import Track
+    from rspeed.estimator import VehicleEstimator
+
+    f = focal_length_px(960, 60.0)
+    seq = synth.SyntheticSequence(f_px=f, image_width=960, image_height=540, seed=3,
+                                  lateral_jitter_px=4.0)
+    frames = seq.run(synth.constant_closing(Z0=22.0, v=5.0), 60)
+    cfg = Config(image_width=960, image_height=540, f_px=f, fps=30.0, q=0.02)
+    est = VehicleEstimator(1, cfg, plate_locator=None)
+    track = Track(id=1, bbox=frames[0].car_bbox, score=1.0, cls=2)
+
+    center_err, width_err = [], []
+    for i, fr in enumerate(frames):
+        gray = cv2.cvtColor(fr.image, cv2.COLOR_BGR2GRAY)
+        e = est.update(gray, track, fr.t, box_measured=(i == 0))
+        assert e.tracking_ok, f"lost the target at frame {i}"
+        bx, by, bw, bh = track.bbox
+        tx, ty, tw, th = fr.car_bbox
+        center_err.append(abs((bx + bw / 2) - (tx + tw / 2)))
+        width_err.append(abs(bw - tw) / tw)
+    # The car grew from 84 px to ~135 px wide over this run.
+    assert frames[-1].car_bbox[2] > 1.5 * frames[0].car_bbox[2]
+    assert max(center_err) < 3.0, max(center_err)
+    assert np.median(width_err) < 0.03, np.median(width_err)
+
+
+def test_scripted_detector_indexes_by_frame_not_call_count():
+    """Regression: a strided pipeline calls the detector every Nth frame. Indexing boxes
+    by call count replayed frame 10's box on frame 50, which is what made every
+    detect_stride > 1 result look broken."""
+    f = focal_length_px(960, 60.0)
+    seq = synth.SyntheticSequence(f_px=f, image_width=960, image_height=540)
+    frames = seq.run(synth.constant_closing(Z0=20.0, v=6.0), 30)
+    det = ScriptedDetector(seq.detector_from(frames, jitter_px=0.0))
+    for i in (0, 10, 20, 29):
+        (d,) = det.detect(frames[i].image)
+        assert d.bbox == frames[i].car_bbox, (i, d.bbox, frames[i].car_bbox)
+
+
 # --- section 7: filter -------------------------------------------------------------------------
 
 
@@ -311,14 +392,15 @@ def test_kappa_reset_on_identity_change():
 # --- end to end --------------------------------------------------------------------------------
 
 
-def _run_sequence(profile, n_frames=140, jitter_px=1.5, seed=7):
-    f = focal_length_px(1280, 60.0)
+def _run_sequence(profile, n_frames=140, jitter_px=1.5, seed=7, stride=1,
+                  width=1280, height=720, **cfg_overrides):
+    f = focal_length_px(width, 60.0)
     cfg = Config(
-        image_width=1280, image_height=720, hfov_deg=60.0, fps=30.0,
-        detect_stride=1, sigma_w_bbox_px=2.5, q=0.02,
+        image_width=width, image_height=height, hfov_deg=60.0, fps=30.0,
+        detect_stride=stride, sigma_w_bbox_px=2.5, q=0.02, **cfg_overrides,
     )
     seq = synth.SyntheticSequence(
-        f_px=f, image_width=1280, image_height=720, fps=30.0, seed=seed
+        f_px=f, image_width=width, image_height=height, fps=30.0, seed=seed
     )
     frames = seq.run(profile, n_frames)
     detector = ScriptedDetector(seq.detector_from(frames, jitter_px=jitter_px))
@@ -401,6 +483,68 @@ def test_plate_detector_is_descheduled_after_lock():
         return
     rate = sum(e.plate_ran for e in after) / len(after)
     assert rate < 0.35, f"plate still running on {rate:.0%} of post-lock frames"
+
+
+def test_detector_stride_keeps_accuracy():
+    """MATH.md section 9: the detector can be strided because registration carries the
+    boxes between detections. At stride 5 the result must stay close to stride 1."""
+    for stride in (3, 5):
+        _pipe, out = _run_sequence(synth.constant_closing(Z0=32.0, v=5.0), stride=stride,
+                                   width=960, height=540)
+        valid = [(fr, e) for fr, e in out if e is not None and e.calibrated]
+        # Uncalibrated until the plate reaches plate_min_width_px, ~24 m at 960 px
+        assert len(valid) > 80, (stride, len(valid))
+        z_err = np.median([abs(e.Z - fr.Z) for fr, e in valid])
+        v_err = np.median([abs(e.Zdot - fr.Zdot) for fr, e in valid])
+        assert z_err < 1.0, (stride, z_err)
+        assert v_err < 0.5, (stride, v_err)
+        assert sum(1 for _fr, e in out if e is not None and not e.box_measured) > 50
+
+
+def test_gate_lockout_is_recovered():
+    """MATH.md 7.5: a filter seeded wrong must not reject correct measurements forever.
+
+    Reproduces the measured failure: with the plate width floor disabled, early plate
+    reads at 11 px seed the range 25% long, P collapses, and the chi-square gate then
+    rejects every correct read for the rest of the run. Without recovery the error
+    stays at metres; with it the filter re-converges.
+    """
+    profile = synth.constant_closing(Z0=32.0, v=5.0)
+    common = dict(stride=3, width=960, height=540, plate_min_width_px=0.0)
+
+    def z_err(**over):
+        _pipe, out = _run_sequence(profile, **common, **over)
+        valid = [(fr, e) for fr, e in out if e is not None and e.calibrated]
+        return float(np.median([abs(e.Z - fr.Z) for fr, e in valid]))
+
+    locked = z_err(reopen_after=10**9)
+    recovered = z_err()
+    assert locked > 3.0, f"the lock-out no longer reproduces ({locked:.2f} m); retarget test"
+    assert recovered < 1.0, recovered
+
+
+def test_lead_ignores_a_single_spurious_detection():
+    """One ghost detection -- a reflection, a sign -- must not take over the readout.
+
+    The ghost is placed dead centre and larger than the real car, so on size and
+    centring alone it would win. It is seen once, and the lead must stay on track 1.
+    """
+    from rspeed.detector import Detection
+
+    f = focal_length_px(960, 60.0)
+    cfg = Config(image_width=960, image_height=540, f_px=f, fps=30.0, q=0.02)
+    seq = synth.SyntheticSequence(f_px=f, image_width=960, image_height=540)
+    frames = seq.run(synth.constant_gap(Z0=18.0), 30)
+
+    def fn(i, _frame):
+        dets = [Detection(bbox=frames[i].car_bbox, score=0.9)]
+        if i == 12:
+            dets.append(Detection(bbox=(380, 10, 200, 150), score=0.6))
+        return dets
+
+    pipe = RelativeSpeedPipeline(cfg, ScriptedDetector(fn), ClassicalPlateLocator("eu"))
+    leads = [pipe.lead(pipe.process(fr.image, fr.t)).track_id for fr in frames]
+    assert set(leads) == {1}, leads
 
 
 # --- standalone runner ----------------------------------------------------------------------------

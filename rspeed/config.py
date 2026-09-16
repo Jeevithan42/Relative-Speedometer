@@ -27,6 +27,11 @@ class Config:
     plate_region: str = "eu"  # key into PLATE_WIDTHS_M
     plate_aspect_tol: float = 0.35  # gate against the fronto-parallel assumption
     plate_min_quality: float = 0.15
+    # Below this the edge fit is not a measurement. At 7-14 px the classical locator
+    # does not return noisy widths, it latches onto a character block and returns the
+    # SAME wrong width frame after frame (measured: 10.4 px x5, then 7.5 px x7, for a
+    # true 14 px) -- which the filter cannot tell from a real reading.
+    plate_min_width_px: float = 18.0
 
     # -- known-feature overrides (manual/live mode) --------------------------------
     # Lets any object of known width stand in for the plate as the absolute anchor.
@@ -45,6 +50,16 @@ class Config:
     gate_nis: float = 9.0  # chi-square 99.7%, 1 DOF
     prior_Z_m: float = 30.0  # seed depth before any calibration exists
     prior_var_lam: float = 4.0  # deliberately huge: ~e^2 factor of depth uncertainty
+    # How long Z/Zdot stay reportable after the last accepted absolute measurement.
+    # Between anchors the filter carries lam forward on Channel B's lamdot, so a brief
+    # plate dropout does not make the readout flicker; sigma_Z grows honestly meanwhile.
+    anchor_hold_s: float = 1.0
+    # Gate lock-out recovery, MATH.md 7.5: after this many consecutive rejected Channel A
+    # measurements that agree with each other, believe them over the filter. A safety
+    # net -- with plate_min_width_px in force it never fired across the synthetic grid;
+    # without it, 12 turned a permanent 5.6 m lock-out into 0.28 m. Shorter runs (8)
+    # also fired on the locator's own latches and made braking worse.
+    reopen_after: int = 12
 
     # -- scale ratio / keyframing (MATH.md 5.3) -----------------------------------
     scale_canonical: int = 96
@@ -65,6 +80,18 @@ class Config:
     plate_refresh_s: float = 2.0  # occasional re-check once locked
     track_max_misses: int = 8
     track_iou_threshold: float = 0.3
+    # Only this many tracks get the full estimator each frame, ranked by how plausibly
+    # each is the vehicle directly ahead. Each costs an ECC registration and a plate
+    # search; a busy scene would otherwise scale the frame cost with the traffic.
+    max_tracks: int = 3
+    # A coasting track retires after this many frames registration cannot place it.
+    track_lost_frames: int = 15
+    # One failed registration is routine (it re-anchors next frame); only this many in
+    # a row is reported as a lost target.
+    lost_grace_frames: int = 3
+    # The lead vehicle changes only when a rival scores this much better, so one noisy
+    # frame -- or a single spurious detection -- cannot reset the readout.
+    lead_switch_margin: float = 0.1
 
     # -- derived ------------------------------------------------------------------
 

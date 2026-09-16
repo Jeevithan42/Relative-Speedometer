@@ -6,3 +6,8 @@ venv/
 *.avi
 *.pt
 .pytest_cache/
+
+# Model weights are fetched, not committed: python main.py fetch-model
+models/
+*.onnx
+*.part

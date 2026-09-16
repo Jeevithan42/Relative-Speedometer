@@ -10,7 +10,7 @@ box from any detector (classical or CNN) is only a *bracket*; the width that act
 feeds the filter comes from `refine_plate_width`, which fits the intensity gradient.
 
 `ClassicalPlateLocator` needs no model weights and no torch, which is what makes this
-runnable today. Swap in `YoloPlateLocator` when you have a trained plate detector --
+runnable today. Swap in `DnnPlateLocator` when you have a trained ONNX plate detector --
 both satisfy the same protocol and the pipeline does not care which it holds.
 """
 
@@ -176,7 +176,9 @@ class ClassicalPlateLocator:
         if vw < self.min_width_px * 2 or vh < 8:
             return None
 
-        sy0 = vy + int(round(vh * self.search_top_frac))
+        # Clamped: at close range the box overhangs the frame, and a negative start row
+        # would slice an empty (or wrapped) region.
+        sy0 = max(0, vy + int(round(vh * self.search_top_frac)))
         sy1 = min(gray.shape[0], vy + vh)
         sx0, sx1 = max(0, vx), min(gray.shape[1], vx + vw)
         if sy1 - sy0 < 8 or sx1 - sx0 < 16:
@@ -244,52 +246,54 @@ class ClassicalPlateLocator:
         return best
 
 
-class YoloPlateLocator:
-    """Trained-detector plate locator. Requires ultralytics + a plate model.
+class DnnPlateLocator:
+    """Trained-detector plate locator, run through cv2.dnn. No torch, no ultralytics.
 
-    The CNN supplies only the bracket; the subpixel width still comes from
-    `refine_plate_width`, because a detector's box regression is nowhere near
-    0.3 px accurate (MATH.md section 3).
+    Takes any single-class (or multi-class, with `classes`) ONNX plate detector in one
+    of the layouts rspeed/dnn.py understands. The CNN supplies only the bracket; the
+    subpixel width still comes from `refine_plate_width`, because a detector's box
+    regression is nowhere near 0.3 px accurate (MATH.md section 3).
+
+    It runs on the lower part of the vehicle box only -- the plate is never on the roof,
+    and a small crop is both faster and a higher effective resolution for the network.
     """
 
-    def __init__(self, weights: str, region: str = "eu", conf: float = 0.25,
-                 aspect_tol: float = 0.35, min_quality: float = 0.1):
-        try:
-            from ultralytics import YOLO  # noqa: PLC0415
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "YoloPlateLocator needs ultralytics: pip install ultralytics"
-            ) from exc
-        self._model = YOLO(weights)
+    def __init__(self, model_path: str, region: str = "eu", input_size: int = 320,
+                 conf: float = 0.25, aspect_tol: float = 0.35, min_quality: float = 0.1,
+                 fmt: str = "auto", classes: tuple[int, ...] | None = None,
+                 search_top_frac: float = 0.35):
+        from .dnn import DnnDetector  # noqa: PLC0415 -- keeps plate.py import-light
+
+        if region not in PLATE_ASPECTS:
+            raise ValueError(f"unknown region {region!r}; expected one of {list(PLATE_ASPECTS)}")
+        self._dnn = DnnDetector(model_path, input_size=input_size, conf=conf,
+                                classes=classes, fmt=fmt)
         self.region = region
         self.nominal_aspect = PLATE_ASPECTS[region]
-        self.conf = float(conf)
         self.aspect_tol = float(aspect_tol)
         self.min_quality = float(min_quality)
+        self.search_top_frac = float(search_top_frac)
 
     def locate(self, gray: np.ndarray, vehicle_bbox: BBox) -> PlateObservation | None:
         vx, vy, vw, vh = vehicle_bbox
-        crop = gray[vy : vy + vh, vx : vx + vw]
-        if crop.size == 0:
+        x0, x1 = max(0, vx), min(gray.shape[1], vx + vw)
+        y0 = max(0, vy + int(round(vh * self.search_top_frac)))
+        y1 = min(gray.shape[0], vy + vh)
+        if x1 - x0 < 16 or y1 - y0 < 8:
             return None
-        bgr = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
-        res = self._model.predict(bgr, conf=self.conf, verbose=False)
-        if not res or res[0].boxes is None or len(res[0].boxes) == 0:
-            return None
+        crop = cv2.cvtColor(gray[y0:y1, x0:x1], cv2.COLOR_GRAY2BGR)
 
-        boxes = res[0].boxes.xyxy.cpu().numpy()
-        confs = res[0].boxes.conf.cpu().numpy()
-        order = np.argsort(-confs)
-
-        for i in order:
-            x1, y1, x2, y2 = boxes[i]
-            bw, bh = float(x2 - x1), float(y2 - y1)
+        # Highest score first: a car rarely shows two plates, so the first candidate
+        # that survives the shape and edge gates is the one.
+        for (bx, by, bw, bh), _score, _cls in sorted(
+            self._dnn.detect_boxes(crop), key=lambda d: -d[1]
+        ):
             if bw < 8 or bh < 3:
                 continue
-            aspect = bw / bh
+            aspect = bw / float(bh)
             if abs(aspect / self.nominal_aspect - 1.0) > self.aspect_tol:
                 continue
-            frame_bbox: BBox = (vx + int(x1), vy + int(y1), int(round(bw)), int(round(bh)))
+            frame_bbox: BBox = (x0 + bx, y0 + by, bw, bh)
             refined = refine_plate_width(gray, frame_bbox)
             if refined is None:
                 continue
@@ -298,7 +302,7 @@ class YoloPlateLocator:
                 continue
             return PlateObservation(
                 w_px=w_px,
-                center=(center_x, vy + (y1 + y2) / 2.0),
+                center=(center_x, y0 + by + bh / 2.0),
                 bbox=frame_bbox,
                 aspect=aspect,
                 quality=quality,

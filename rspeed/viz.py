@@ -51,8 +51,12 @@ def draw_overlay(
             cv2.putText(out, f"{e.plate.w_px:.1f}px", (px, py - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, _AMBER, 1, cv2.LINE_AA)
 
-        label = f"#{e.track_id}"
-        if e.calibrated and e.Zdot is not None:
+        # "det" = the detector produced this box this frame; "trk" = registration moved
+        # it here. Only a "det" box may anchor Channel A (MATH.md 5.4).
+        label = f"#{e.track_id} {'det' if e.box_measured else 'trk'}"
+        if not e.tracking_ok:
+            label += "  [LOST]"
+        elif e.calibrated and e.Zdot is not None:
             label += f"  {e.Z:.1f}m  {e.Zdot * 3.6:+.1f}km/h"
         else:
             label += "  [uncalibrated]"

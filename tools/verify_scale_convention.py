@@ -82,6 +82,35 @@ def main() -> int:
     print(f"\nECC convention -> {winner}")
     if ml > 0.05:
         print("log-polar sign may need flipping (shift_x -> -shift_x)")
+
+    # The translation half of the warp is what tracks the target (MATH.md 5.4). A sign
+    # slip there moves the box AWAY from the target, which then looks like tracking loss
+    # rather than an obvious error -- so it gets the same empirical treatment.
+    print(f"\n{'shift':>14} {'scale':>6} {'located':>18} {'error px':>10}")
+    print("-" * 52)
+    big = np.full((600, 600), 90, dtype=np.uint8)
+    big[172:428, 172:428] = base
+    anchor = (300.0, 300.0)
+    worst = 0.0
+    for (dx, dy), s in (((5.0, -3.0), 1.0), ((22.0, 8.0), 1.08), ((-35.0, 14.0), 0.95)):
+        M = cv2.getRotationMatrix2D(anchor, 0.0, s)
+        M[:, 2] += (dx, dy)
+        moved = cv2.warpAffine(big, M, (600, 600), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
+        tracker = ScaleEstimator(roi_factor=1.0, roi_max=512)
+        tracker.anchor(big, anchor, 256.0, 0.0)
+        m = tracker.measure(moved, anchor, 0.1)
+        truth = (anchor[0] + dx, anchor[1] + dy)
+        if m is None or m.center is None:
+            print(f"({dx:+5.1f},{dy:+5.1f}) {s:6.2f} {'FAILED':>18}")
+            worst = float("inf")
+            continue
+        err = math.hypot(m.center[0] - truth[0], m.center[1] - truth[1])
+        worst = max(worst, err)
+        print(f"({dx:+5.1f},{dy:+5.1f}) {s:6.2f} "
+              f"({m.center[0]:7.2f},{m.center[1]:7.2f}) {err:10.3f}")
+    print(f"\ntranslation -> {'OK' if worst < 1.0 else 'WRONG: check ScaleEstimator._locate'}"
+          f" (worst {worst:.3f} px)")
     return 0
 
 

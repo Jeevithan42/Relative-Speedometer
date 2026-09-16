@@ -253,10 +253,17 @@ class SyntheticSequence:
         The jitter is the point: it stands in for real box-regression noise, so tests
         exercise the case where Channel A's large-feature measurement is noisy and
         Channel B has to carry the velocity.
+
+        The box is looked up by the image it is handed, not by the call count. A strided
+        pipeline calls the detector every Nth frame, and indexing by call count silently
+        replayed frame 10's box on frame 50 -- which is what made every detect_stride > 1
+        run look broken.
         """
         rng = np.random.default_rng(seed)
+        by_image = {id(fr.image): i for i, fr in enumerate(frames)}
 
-        def fn(index: int, _frame: np.ndarray) -> list[Detection]:
+        def fn(index: int, frame: np.ndarray) -> list[Detection]:
+            index = by_image.get(id(frame), index)
             if index >= len(frames):
                 return []
             x, y, w, h = frames[index].car_bbox

@@ -78,6 +78,30 @@ class Calibration:
             f"[{self.method}, {self.n_views} views, rms {self.rms_reproj_error:.3f}px]"
         )
 
+    def focal_for(self, width: int, height: int) -> tuple[float | None, str]:
+        """fx for frames of this size, or (None, reason) if the calibration cannot apply.
+
+        fx is in pixels, so it is only valid at the resolution it was measured at. Using
+        a 1280x720 calibration on 640x480 frames is not a small error: the mode change
+        alters both the pixel pitch and, often, the sensor crop, and every range comes
+        out wrong by that factor.
+
+          same size         -> exact
+          same aspect ratio -> scaled by width, on the assumption the driver downscales
+                               the same sensor area (usually true; worth confirming)
+          different aspect  -> refused: 4:3 and 16:9 modes crop the sensor differently,
+                               and no scale factor recovers that
+        """
+        if (width, height) == (self.image_width, self.image_height):
+            return self.fx, "exact"
+        if abs(width / height - self.image_width / self.image_height) < 0.01:
+            fx = self.fx * width / self.image_width
+            return fx, (f"scaled from {self.image_width}x{self.image_height} "
+                        f"(same aspect; assumes the camera downscales, not crops)")
+        return None, (f"calibrated at {self.image_width}x{self.image_height} but frames are "
+                      f"{width}x{height}, a different aspect ratio -- the sensor crop "
+                      f"differs, so recalibrate at this resolution")
+
 
 # --- enumeration and capture ---------------------------------------------------------------
 

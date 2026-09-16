@@ -2,16 +2,19 @@
 
 Deliberately pluggable. The measurement mathematics (geometry, filter, scale, plate)
 carries all the value in this project and none of it depends on which detector is
-present, so the detector is behind a two-method protocol and the package imports
-cleanly with no torch installed.
+present, so the detector is behind a one-method protocol.
 
 Backends:
-  * YoloVehicleDetector  -- ultralytics YOLO, COCO vehicle classes. Production path.
-  * ScriptedDetector     -- returns boxes from a supplied callable. Used by the
-                            synthetic harness so the whole pipeline is testable
-                            without any model weights.
+  * DnnVehicleDetector  -- an ONNX COCO detector run through cv2.dnn (rspeed/dnn.py).
+                           No torch, no ultralytics. Production path.
+  * ScriptedDetector    -- returns boxes from a supplied callable. Used by the
+                           synthetic harness so the whole pipeline is testable
+                           without any model weights.
 
 `IouTracker` gives stable integer track ids without any external tracker dependency.
+Between detector frames the boxes are not left stale: the estimator moves them with the
+translation and scale out of Channel B's registration (MATH.md 5.4).
+
 Track identity matters more here than in ordinary detection work: an ID switch
 silently invalidates a track's kappa calibration (MATH.md section 11), so the pipeline
 destroys calibration state whenever an id is retired.
@@ -28,6 +31,10 @@ BBox = tuple[int, int, int, int]  # x, y, w, h
 
 # COCO class ids that are rear-facing vehicles worth ranging.
 COCO_VEHICLE_CLASSES = (2, 3, 5, 7)  # car, motorcycle, bus, truck
+
+# The Channel B anchor sits this far down the vehicle box -- on the rear face, near the
+# plate, rather than on roofline and sky.
+REAR_ANCHOR_FRAC = 0.70
 
 
 @dataclass
@@ -64,7 +71,7 @@ class Track:
         """Centre of the lower half of the box -- closer to where a plate sits, which
         keeps the scale-ratio ROI on the rear face rather than on roofline and sky."""
         x, y, w, h = self.bbox
-        return (x + w / 2.0, y + h * 0.70)
+        return (x + w / 2.0, y + h * REAR_ANCHOR_FRAC)
 
 
 class VehicleDetector(Protocol):
@@ -84,56 +91,6 @@ class ScriptedDetector:
     def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
         self._frame_index += 1
         return self._fn(self._frame_index, frame_bgr)
-
-
-class YoloVehicleDetector:  # pragma: no cover - requires optional dependency
-    """Ultralytics YOLO restricted to vehicle classes."""
-
-    def __init__(
-        self,
-        weights: str = "yolo11n.pt",
-        conf: float = 0.35,
-        imgsz: int = 640,
-        classes: tuple[int, ...] = COCO_VEHICLE_CLASSES,
-        device: str | None = None,
-    ):
-        try:
-            from ultralytics import YOLO  # noqa: PLC0415
-        except ImportError as exc:
-            raise ImportError(
-                "YoloVehicleDetector needs ultralytics: pip install ultralytics"
-            ) from exc
-        self._model = YOLO(weights)
-        self.conf = float(conf)
-        self.imgsz = int(imgsz)
-        self.classes = list(classes)
-        self.device = device
-
-    def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
-        res = self._model.predict(
-            frame_bgr,
-            conf=self.conf,
-            imgsz=self.imgsz,
-            classes=self.classes,
-            device=self.device,
-            verbose=False,
-        )
-        out: list[Detection] = []
-        if not res or res[0].boxes is None:
-            return out
-        boxes = res[0].boxes
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy()
-        clss = boxes.cls.cpu().numpy().astype(int)
-        for (x1, y1, x2, y2), c, k in zip(xyxy, confs, clss):
-            out.append(
-                Detection(
-                    bbox=(int(x1), int(y1), int(round(x2 - x1)), int(round(y2 - y1))),
-                    score=float(c),
-                    cls=int(k),
-                )
-            )
-        return out
 
 
 # --- tracking ---------------------------------------------------------------------------
@@ -168,6 +125,13 @@ class IouTracker:
     @property
     def tracks(self) -> list[Track]:
         return list(self._tracks.values())
+
+    def get(self, tid: int) -> Track | None:
+        return self._tracks.get(tid)
+
+    def drop(self, tid: int) -> None:
+        """Retire a track early -- e.g. its propagated box has left the frame."""
+        self._tracks.pop(tid, None)
 
     def update(self, detections: list[Detection]) -> tuple[list[Track], list[int]]:
         """Associate detections to tracks.

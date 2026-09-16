@@ -13,7 +13,8 @@ Usage
   python main.py budget                        error budget for a camera config
   python main.py synth --scenario closing      run against synthetic ground truth
   python main.py selftest                      validate the math
-  python main.py video --source clip.mp4       run on real footage
+  python main.py fetch-model                   download the ONNX vehicle detector
+  python main.py video --source clip.mp4       run on real footage (or --source 0)
 """
 
 from __future__ import annotations
@@ -29,15 +30,18 @@ import cv2
 import numpy as np
 
 from rspeed import cli_live, synth
+from rspeed.camera import open_camera
 from rspeed.config import Config
 from rspeed.detector import ScriptedDetector
+from rspeed.dnn import DEFAULT_MODEL, FORMATS, MODEL_ZOO, DnnVehicleDetector, fetch_model
 from rspeed.geometry import (
     focal_length_px,
     speed_noise_from_width_noise,
     width_from_depth,
 )
 from rspeed.pipeline import RelativeSpeedPipeline
-from rspeed.plate import ClassicalPlateLocator
+from rspeed.noise import DEFAULT_NOISE_PROFILE
+from rspeed.plate import ClassicalPlateLocator, DnnPlateLocator
 from rspeed.viz import draw_overlay
 
 SCENARIOS = {
@@ -194,91 +198,166 @@ def _report(rows, pipe: RelativeSpeedPipeline, proc_s: float) -> None:
 # --- real video -------------------------------------------------------------------------------
 
 
+class _TimedDetector:
+    """Wraps a detector to account its cost separately -- it is the dominant stage, so
+    it is the number that decides detect_stride (MATH.md section 9)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.seconds = 0.0
+        self.calls = 0
+
+    def detect(self, frame_bgr):
+        t0 = time.perf_counter()
+        try:
+            return self.inner.detect(frame_bgr)
+        finally:
+            self.seconds += time.perf_counter() - t0
+            self.calls += 1
+
+
 def cmd_video(args: argparse.Namespace) -> int:
-    cap = cv2.VideoCapture(int(args.source) if args.source.isdigit() else args.source)
-    if not cap.isOpened():
-        print(f"cannot open source {args.source!r}", file=sys.stderr)
-        return 2
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or args.width
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or args.height
-    fps = cap.get(cv2.CAP_PROP_FPS) or args.fps
-
-    cfg = Config(
-        image_width=width, image_height=height, hfov_deg=args.hfov,
-        f_px=args.focal, fps=fps, plate_region=args.region,
-        detect_stride=args.detect_stride, q=args.q,
-    )
-    print(f"source {args.source}: {width}x{height} @ {fps:.1f} fps, f = {cfg.focal_px:.1f} px")
-    if args.focal is None:
-        print("WARNING: focal length derived from --hfov. Calibrate with a checkerboard "
-              "(cv2.calibrateCamera -> fx) and pass --focal for trustworthy absolute range.")
+    """Automatic detection on a video file or a live camera. No manual box needed."""
+    is_live = args.source.isdigit()
 
     try:
-        from rspeed.detector import YoloVehicleDetector
-        detector = YoloVehicleDetector(weights=args.weights, conf=args.conf)
-    except ImportError as exc:
+        detector = _TimedDetector(DnnVehicleDetector(
+            args.model, input_size=args.input_size, conf=args.conf, fmt=args.model_format,
+        ))
+    except FileNotFoundError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
-        print("Real video needs a vehicle detector. Install it with:", file=sys.stderr)
-        print("    pip install ultralytics", file=sys.stderr)
-        print("\nThe math is still fully exercisable without it:", file=sys.stderr)
+        print("The math is still fully exercisable without a model:", file=sys.stderr)
         print("    python main.py synth --scenario closing", file=sys.stderr)
         return 3
 
+    if is_live:
+        # A calibration or noise profile describes one camera, so they are only applied
+        # to a camera by default. For a file they must be asked for explicitly.
+        args.calib = args.calib or cli_live.DEFAULT_CALIB
+        args.noise = args.noise or DEFAULT_NOISE_PROFILE
+        req_w, req_h = cli_live.default_resolution(args)
+        try:
+            cap = open_camera(int(args.source), req_w, req_h)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        nominal_fps = args.fps
+    else:
+        cap = cv2.VideoCapture(args.source)
+        if not cap.isOpened():
+            print(f"cannot open source {args.source!r}", file=sys.stderr)
+            return 2
+        nominal_fps = cap.get(cv2.CAP_PROP_FPS)
+        if not nominal_fps or nominal_fps <= 0 or not math.isfinite(nominal_fps):
+            print(f"file reports no frame rate; assuming --fps {args.fps:g}. A wrong "
+                  f"frame rate scales every speed by the same factor.")
+            nominal_fps = args.fps
+
+    ok, frame = cap.read()
+    if not ok:
+        print("source delivered no frames", file=sys.stderr)
+        cap.release()
+        return 2
+    height, width = frame.shape[:2]
+
+    f_px, calib = cli_live.resolve_intrinsics(args, width, height)
+    sigma_w, sigma_s = cli_live.resolve_noise(args, width, height)
+    cfg = Config(
+        image_width=width, image_height=height, hfov_deg=args.hfov, f_px=f_px,
+        fps=nominal_fps, plate_region=args.region, detect_stride=args.detect_stride,
+        q=args.q, sigma_w_plate_px=sigma_w, sigma_s_base=sigma_s,
+    )
+    maps = calib.undistort_maps() if (calib and any(calib.dist)) else None
+
     locator = ClassicalPlateLocator(region=args.region)
-    if args.plate_weights:
-        from rspeed.plate import YoloPlateLocator
-        locator = YoloPlateLocator(args.plate_weights, region=args.region)
-
+    if args.plate_model:
+        locator = DnnPlateLocator(args.plate_model, region=args.region,
+                                  fmt=args.model_format)
     pipe = RelativeSpeedPipeline(cfg, detector, locator)
-    writer = None
-    if args.save:
-        writer = cv2.VideoWriter(
-            args.save, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-        )
 
-    is_live = args.source.isdigit()
+    print(f"source {args.source}: {width}x{height} @ {nominal_fps:.1f} fps nominal, "
+          f"f = {cfg.focal_px:.1f} px, detector every {cfg.detect_stride} frames")
     if is_live:
         print("live source: timestamping frames on arrival, not by frame index "
               "(nominal fps is unreliable on cameras and a wrong dt scales every "
               "speed reading)")
 
-    i, t0 = 0, time.perf_counter()
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        # A file has a trustworthy frame rate; a camera does not. MATH.md (5.4)
-        # divides by the baseline, so dt errors propagate straight into speed.
-        t = (time.perf_counter() - t0) if is_live else (i / fps)
-        ests = pipe.process(frame, t)
-        lead = pipe.lead(ests)
-        vis = draw_overlay(frame, ests, lead)
-        if writer is not None:
-            writer.write(vis)
-        if args.show:
-            cv2.imshow("relative speedometer", vis)
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
-        if lead is not None and i % max(1, int(fps // 2)) == 0:
-            ttc = "inf" if not math.isfinite(lead.ttc) else f"{lead.ttc:5.2f}s"
-            if lead.calibrated and lead.Zdot is not None:
-                print(f"t={t:6.2f}  Z={lead.Z:6.2f}m  Zdot={lead.Zdot * 3.6:+7.2f}km/h  TTC={ttc}")
-            else:
-                print(f"t={t:6.2f}  [uncalibrated]  TTC={ttc}")
-        i += 1
+    writer = None
+    if args.save:
+        writer = cv2.VideoWriter(
+            args.save, cv2.VideoWriter_fourcc(*"mp4v"), nominal_fps, (width, height)
+        )
 
-    cap.release()
-    if writer is not None:
-        writer.release()
-        print(f"wrote {args.save}")
-    if args.show:
-        cv2.destroyAllWindows()
-    print(f"\n{i} frames in {time.perf_counter() - t0:.1f}s "
-          f"({i / max(time.perf_counter() - t0, 1e-9):.1f} fps)")
+    i, t0 = 0, time.perf_counter()
+    t_arrival0 = t0
+    next_print = 0.0
+    proc_s = 0.0
+    try:
+        while True:
+            if maps is not None:
+                frame = cv2.remap(frame, maps[0], maps[1], cv2.INTER_LINEAR)
+            # A file has a trustworthy frame rate; a camera does not. MATH.md (5.4)
+            # divides by the baseline, so dt errors propagate straight into speed.
+            t = (time.perf_counter() - t_arrival0) if is_live else (i / nominal_fps)
+            if args.duration and t >= args.duration:
+                break
+            tp = time.perf_counter()
+            ests = pipe.process(frame, t)
+            lead = pipe.lead(ests)
+            proc_s += time.perf_counter() - tp
+
+            if writer is not None or args.show:
+                vis = draw_overlay(frame, ests, lead)
+                if writer is not None:
+                    writer.write(vis)
+                if args.show:
+                    cv2.imshow("relative speedometer", vis)
+                    if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
+                        break
+            if lead is not None and t >= next_print:
+                next_print = t + 0.5
+                ttc = "inf" if not math.isfinite(lead.ttc) else f"{lead.ttc:5.2f}s"
+                if lead.calibrated and lead.Zdot is not None:
+                    print(f"t={t:6.2f}  #{lead.track_id}  Z={lead.Z:6.2f}m  "
+                          f"Zdot={lead.Zdot * 3.6:+7.2f}km/h  TTC={ttc}")
+                else:
+                    print(f"t={t:6.2f}  #{lead.track_id}  [uncalibrated]  TTC={ttc}")
+            i += 1
+            ok, frame = cap.read()
+            if not ok:
+                break
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+            print(f"wrote {args.save}")
+        if args.show:
+            cv2.destroyAllWindows()
+
+    wall = time.perf_counter() - t0
+    print(f"\n{i} frames in {wall:.1f}s ({i / max(wall, 1e-9):.1f} fps end to end)")
+    if i:
+        det_ms = 1000.0 * detector.seconds / max(1, detector.calls)
+        other_ms = 1000.0 * (proc_s - detector.seconds) / i
+        print(f"detector {det_ms:.0f} ms/call on {detector.calls} frames "
+              f"({detector.calls / i:.0%}); everything else {other_ms:.1f} ms/frame")
     cost = pipe.cost_summary
-    print(f"detector on {cost['detector_rate']:.1%} of frames, "
-          f"plate on {cost['plate_rate']:.1%}")
+    print(f"plate locator on {cost['plate_rate']:.1%} of frames")
+    return 0
+
+
+def cmd_fetch_model(args: argparse.Namespace) -> int:
+    """Download the ONNX vehicle detector. Plain HTTPS + a checksum; no torch involved."""
+    spec = MODEL_ZOO[args.name]
+    print(f"{args.name}: {spec.note}")
+    print(f"  from {spec.url}")
+    try:
+        path = fetch_model(args.name, args.dir)
+    except (OSError, RuntimeError) as exc:
+        print(f"download failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"  ok: {path} (sha256 verified)")
+    print(f"\nRun it:  python main.py video --source 0 --show --model {path}")
     return 0
 
 
@@ -286,7 +365,7 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
     """Run every validation suite. Non-zero if any test fails."""
     tests_dir = Path(__file__).parent / "tests"
     rc = 0
-    for name in ("test_math.py", "test_live.py"):
+    for name in ("test_math.py", "test_live.py", "test_dnn.py"):
         path = tests_dir / name
         if not path.exists():
             continue
@@ -330,22 +409,40 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--save", help="write an annotated mp4 here")
     s.set_defaults(func=cmd_synth)
 
-    v = sub.add_parser("video", help="run on real footage or a camera index")
+    v = sub.add_parser("video", help="automatic detection on a video file or camera")
     v.add_argument("--source", required=True, help="video path or camera index")
-    v.add_argument("--weights", default="yolo11n.pt")
-    v.add_argument("--plate-weights", help="optional trained plate detector")
+    v.add_argument("--model", default=DEFAULT_MODEL,
+                   help="ONNX detector (python main.py fetch-model gets the default)")
+    v.add_argument("--model-format", default="auto", choices=list(FORMATS))
+    v.add_argument("--input-size", type=int, default=416,
+                   help="network input side, multiple of 32; 416 is ~3x cheaper than 640")
+    v.add_argument("--plate-model", help="optional ONNX plate detector")
     v.add_argument("--conf", type=float, default=0.35)
-    v.add_argument("--focal", type=float, help="fx in px from checkerboard calibration")
-    v.add_argument("--hfov", type=float, default=60.0, help="used only if --focal absent")
-    v.add_argument("--width", type=int, default=1920)
-    v.add_argument("--height", type=int, default=1080)
-    v.add_argument("--fps", type=float, default=30.0)
+    v.add_argument("--calib", default=None,
+                   help="calibration file (default: calibration.json for cameras only)")
+    v.add_argument("--focal", type=float, help="fx in px, overrides --calib and --hfov")
+    v.add_argument("--hfov", type=float, default=60.0, help="last-resort guess for fx")
+    v.add_argument("--noise", default=None,
+                   help="noise profile (default: noise.json for cameras only)")
+    v.add_argument("--sigma-w", type=float, help="plate width noise px, overrides --noise")
+    v.add_argument("--sigma-s", type=float, help="scale-ratio noise, overrides --noise")
+    v.add_argument("--width", type=int, help="camera mode to request")
+    v.add_argument("--height", type=int)
+    v.add_argument("--fps", type=float, default=30.0,
+                   help="used only when a file reports no frame rate, and for --save")
     v.add_argument("--region", default="eu", choices=["eu", "us", "jp", "au"])
-    v.add_argument("--detect-stride", type=int, default=3)
+    v.add_argument("--detect-stride", type=int, default=5,
+                   help="run the detector every Nth frame; registration tracks between")
     v.add_argument("--q", type=float, default=0.008)
+    v.add_argument("--duration", type=float, help="stop after this many seconds")
     v.add_argument("--show", action="store_true")
     v.add_argument("--save", help="write an annotated mp4 here")
     v.set_defaults(func=cmd_video)
+
+    fm = sub.add_parser("fetch-model", help="download the ONNX vehicle detector")
+    fm.add_argument("--name", default="yolox_s", choices=sorted(MODEL_ZOO))
+    fm.add_argument("--dir", default="models")
+    fm.set_defaults(func=cmd_fetch_model)
 
     t = sub.add_parser("selftest", help="validate every derivation in MATH.md")
     t.set_defaults(func=cmd_selftest)

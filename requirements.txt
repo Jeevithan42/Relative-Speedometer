@@ -1,4 +1,5 @@
-# Core -- the measurement mathematics needs only these.
+# The whole project -- measurement maths, tracking, and vehicle detection -- needs only
+# these two. No torch, no ultralytics: detection runs ONNX models through cv2.dnn.
 numpy>=1.24
 opencv-python>=4.8
 
@@ -7,7 +8,7 @@ opencv-python>=4.8
 # which breaks `live` (cv2.selectROI / imshow) even though the maths is unaffected.
 # scipy was listed here originally and is not imported anywhere; dropped, which also
 # removes a spurious numpy-2.x incompatibility warning.
-
-# Optional: real-video vehicle detection. Everything else works without it,
-# including the full test suite against synthetic ground truth.
-# ultralytics>=8.3
+#
+# Tested on opencv-python 5.0. OpenCV 5 removed the Darknet importer (.cfg/.weights),
+# which is why the detector is ONNX-only. The model itself is not a pip dependency:
+#   python main.py fetch-model

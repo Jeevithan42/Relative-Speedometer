@@ -319,6 +319,65 @@ blur) and registration degrades. Resolve with an **adaptive keyframe**:
 
 This gives a long baseline where the scene permits and a short one where it doesn't.
 
+### 5.4 Tracking for free: the translation half of the warp
+
+ECC does not return a scale. It returns a full affine warp, and `s` is only the
+determinant of its linear part. The other two parameters say where the target moved —
+so the registration that Channel B already pays for *is* a tracker.
+
+Write patch coordinates `u` (canonical pixels, `n` of them across) for both the keyframe
+patch and the current patch. `cv2.findTransformECC(template=current, input=keyframe)`
+returns a warp mapping current-patch coordinates to keyframe-patch coordinates:
+
+```
+  u_ref  =  A * u_cur  +  b                                          (5.6)
+```
+
+Let `p_k` be the keyframe's anchor point (the rear-centre of the box when the keyframe
+was dropped). Its patch coordinate is known, and inverting (5.6) says where that same
+physical point sits in the current patch:
+
+```
+  u_cur  =  A^-1 * ( u_ref(p_k) - b )                                (5.7)
+```
+
+Each patch pixel covers `k = roi/n` frame pixels, with pixel centres at integers, so a
+patch coordinate maps back to the frame as
+
+```
+  p  =  origin + (u + 0.5) * k  -  0.5                               (5.8)
+```
+
+with `origin` the crop's top-left corner. The box then follows: its size is the
+keyframe box times `s`, and its offset from the anchor also grows by `s`.
+
+Three properties make this better than a separate tracker, not just cheaper:
+
+1. **It scales.** A general-purpose tracker such as TrackerMIL holds its box size fixed,
+   so on a target whose distance is changing — the only case this project exists for —
+   the plate bracket slides off the plate. Here the box size comes from the same `s`
+   that feeds the filter.
+2. **It does not drift within a keyframe.** Every frame registers against the keyframe,
+   not the previous frame, so position error does not accumulate between re-anchors.
+3. **It costs nothing extra.** The warp is already computed. Measured: TrackerMIL took
+   110–140 ms per frame, over 90% of the live loop; the measurement maths alone runs in
+   about 9 ms.
+
+ECC is a local optimiser and only converges when the target has moved a fraction of the
+patch. For larger jumps, phase correlation between the two patches seeds the translation
+first (the warp starts at `b = -d` for a measured content shift `d`). Registration then
+converges from 60 px jumps on a 140 px window. The seed is skipped for sub-pixel shifts,
+so a static scene is registered exactly as it was when `sigma_s` was measured.
+
+**Only a detected box is a measurement.** A propagated box's width is `w_keyframe * s`.
+Feeding it to Channel A as if it were an independent width would count Channel B's
+information twice and make the filter overconfident. So Channel A (and the kappa
+transfer) uses the vehicle box only on frames where a detector produced it.
+
+The sign convention of (5.6) is easy to get backwards, and a wrong sign moves the box
+*away* from the target, which looks like ordinary tracking loss.
+`tools/verify_scale_convention.py` checks it empirically alongside the scale convention.
+
 ---
 
 ## 6. Comparing the two channels
@@ -421,6 +480,40 @@ Reject a measurement when its normalised innovation squared exceeds a chi-square
 threshold: `y^2/S > chi2(1, 0.997) = 9`. This is what protects the filter from a
 mis-detection, a track ID switch, or a failed registration.
 
+### 7.5 Gate lock-out, and why the plate needs a minimum width
+
+Gating has a failure mode that looks like success. Suppose the first few Channel A
+measurements are wrong in the same direction. They seed `lam`, `P[0,0]` collapses around
+them within a handful of updates, and from then on every *correct* measurement sits
+many sigma away from the overconfident filter and gets rejected. Nothing ever corrects
+it. On the synthetic closing run at detector stride 3 this left a **permanent 25% range
+error** (5.6 m median) while the NIS looked healthy, because the rejected measurements
+never reach the NIS log.
+
+The bad seeds all came from plates **7–14 px wide**. There the classical locator does
+not return noisy widths; it latches onto a character block and returns the *same* wrong
+width frame after frame (measured: 10.4 px five frames running, then 7.5 px seven frames
+running, for a true 14 px). An error model of `sigma_w / w` cannot describe that, and
+the filter cannot tell a steady wrong reading from a steady right one.
+
+Two defences, in order of importance:
+
+1. **Keep the measurement inside its valid regime.** Channel A rejects plates narrower
+   than `plate_min_width_px` = 18 px. That is about 24 m at 960 px / 60°, and 28 m on the
+   calibrated 1280 px LifeCam — past the 5–20 m usable range of §3 anyway. Across the
+   whole synthetic grid (5 scenarios × strides 1/3/5 × 3 seeds) no lock-out occurred with
+   the floor in place. Range is simply reported later; TTC is unaffected.
+2. **Recover if it happens anyway.** If `reopen_after` = 12 consecutive Channel A
+   measurements are all rejected, all share a sign, and their spread is under half their
+   median, the filter is taken to be wrong: `lam` shifts by the median innovation, and
+   `P[0,0]` re-opens to the size of that disagreement. `lamdot` is untouched, since
+   Channel B keeps it honest independently.
+
+The run length matters, because agreement is not proof: a latched locator also agrees
+with itself. A run of 8 fired on those latches and tripled the range error during the
+brake scenario. A run of 12 still fixes the lock-out (5.6 m → 0.28 m with the width floor
+disabled) and is the tested safety net.
+
 ---
 
 ## 8. Plate-calibrates-larger-feature (the `kappa` transfer)
@@ -464,14 +557,25 @@ camera is stable, so it is stored on the track and destroyed with it.
 
 ## 9. Cost model
 
-Per-frame cost with the scheduling in §8:
+Per-frame cost with the scheduling in §8, measured on an 8-thread laptop CPU
+(OpenCV 5.0):
 
-| Stage | When it runs | Relative cost |
+| Stage | When it runs | Cost |
 |---|---|---|
-| Vehicle detection | every `k`th frame (`k` about 3), tracked in between | high |
-| Plate localisation | only while `kappa_big` unlocked, plus 1 refresh frame per ~2 s | medium |
-| ECC registration | every frame, on a ~64x64 crop | low |
+| Vehicle detection (YOLOX-s ONNX, 416 input) | every `k`th frame (`k` = 5), tracked in between by §5.4 | 130–200 ms per call → 26–40 ms/frame amortised |
+| Plate localisation | only while `kappa_big` unlocked, plus 1 refresh frame per ~2 s | a few ms |
+| ECC registration + tracking | every frame, on a 96x96 canonical crop | a few ms |
 | EKF | every frame, 2x2 | negligible |
+
+Everything except the detector came to 16 ms/frame on a 640x480 real-image clip, for
+18.5 fps end to end at `k` = 5. The tracker it replaced (TrackerMIL) cost 110–140 ms per
+frame on its own.
+
+Striding the detector is only safe because §5.4 carries the boxes between detections. A
+box left stale for `k` frames drifts off a closing target, and at `k` = 3 the old
+pipeline's range error was 4 m. With propagation, stride 5 matches stride 1 (see
+README). Only up to `max_tracks` = 3 tracks, ranked by how plausibly each is the lead
+vehicle, get the full estimator, so frame cost does not grow with the traffic.
 
 The fusion therefore *reduces* steady-state cost rather than adding to it: without the
 `kappa` transfer you would need the plate detector on every frame forever, and it would
@@ -509,6 +613,8 @@ noise). `tests/test_math.py` reports this.
 | Rectilinear lens | Uncorrected distortion | Width error grows toward frame edge | Undistort, or calibrate and correct per-position |
 | Global shutter | Rolling shutter + lateral motion | Plate skews, `w` biased | Global-shutter camera, or accept the bias |
 | Stable track identity | ID switch | `kappa_big` silently invalid | Destroy `kappa` on ID change; gating catches the rest |
+| Stable lead choice | Spurious detection, adjacent car | Readout jumps to another vehicle's filter | Lead hysteresis; penalise tracks seen once or no longer detected |
+| Plate resolvable | Plate under ~18 px | Locator latches, filter seeded wrong, gate lock-out (§7.5) | `plate_min_width_px` floor; lock-out recovery |
 | Rigid target | Suspension pitch/dive | 1-2 Hz modulation of apparent size | Width-based ranging is largely immune (unlike ground-plane methods); `Q` absorbs the rest |
 
 **Ego motion.** All of the above yields *relative* speed, which already includes your own
@@ -522,19 +628,23 @@ own from OBD-II or GPS: `v_lead = v_ego + Zdot`.
 ```
   frame
     |
-    +- vehicle detect + track ----------------> bbox, track id
+    +- ONNX vehicle detect (every kth frame) + IoU track --> bbox, track id
     |                                             |
-    +- plate localise (while unlocked) --> w_plate|
+    +- ECC register vs keyframe --> s, and where the target moved (5.4)
+    |        |                                    |
+    |        |                    between detections: move the box by the warp
+    |        |                                    |
+    +- plate localise in box (while unlocked) --> w_plate  (>= 18 px only, 7.5)
+    |        |                                    |
+    |        |                          kappa transfer (8.1), detected boxes only
+    |        |                                    |
+    +- w_big from a DETECTED box --> Channel A update (7.5)
+    |        |                                    |
+    |        +-------------------------> Channel B update (7.6)
     |                                             |
-    |                                    kappa transfer (8.1)
+    |                                     EKF [lam, lamdot]
     |                                             |
-    +- measure w_big (bbox / taillights) --> ln(w_big)
-    |                                             |
-    |                                  Channel A update (7.5)
-    |                                             |
-    +- ECC register vs keyframe --> s ---> Channel B update (7.6)
-                                                  |
-                                          EKF [lam, lamdot]
+    +- lead selection with hysteresis             |
                                                   |
                        Z = exp(-lam),  Zdot = -lamdot*exp(-lam),  TTC = 1/lamdot
 ```

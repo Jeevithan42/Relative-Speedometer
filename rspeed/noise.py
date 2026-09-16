@@ -13,8 +13,10 @@ too large -- so stationarity is checked first and reported, never assumed.
 
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -23,6 +25,40 @@ from .plate import refine_plate_width
 from .scale import ScaleEstimator
 
 BBox = tuple[int, int, int, int]
+
+DEFAULT_NOISE_PROFILE = "noise.json"
+
+
+@dataclass
+class NoiseProfile:
+    """Measured noise, persisted so live runs use it instead of the config placeholders.
+
+    Like a calibration, it belongs to one camera at one resolution: sigma_w is in pixels,
+    and sigma_s depends on how much texture a patch carries at that pixel pitch.
+    """
+
+    sigma_w_px: float  # -> Config.sigma_w_plate_px
+    sigma_s: float  # -> Config.sigma_s_base
+    mean_w_px: float  # the feature width sigma_w was measured on
+    image_width: int
+    image_height: int
+    measured_fps: float = 0.0
+    source: str = "measure-noise"
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+    @staticmethod
+    def load(path: str | Path) -> "NoiseProfile":
+        return NoiseProfile(**json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def matches(self, width: int, height: int) -> bool:
+        return (width, height) == (self.image_width, self.image_height)
+
+    def summary(self) -> str:
+        return (f"sigma_w={self.sigma_w_px:.3f}px (on {self.mean_w_px:.0f}px)  "
+                f"sigma_s={self.sigma_s:.5f}  at {self.image_width}x{self.image_height}  "
+                f"[{self.source}]")
 
 
 @dataclass
@@ -49,6 +85,13 @@ class NoiseReport:
         return (self.stationary and self.n_width >= 20 and self.n_scale >= 10
                 and not math.isnan(self.sigma_w_px)
                 and self.sigma_w_px < 0.05 * max(self.mean_w_px, 1.0))
+
+    def to_profile(self, image_width: int, image_height: int) -> NoiseProfile:
+        return NoiseProfile(
+            sigma_w_px=float(self.sigma_w_px), sigma_s=float(self.sigma_s),
+            mean_w_px=float(self.mean_w_px), image_width=int(image_width),
+            image_height=int(image_height), measured_fps=float(self.measured_fps),
+        )
 
     def implied_speed_noise(self, f_px: float, width_m: float, Z: float,
                             n_frames: int = 15, dt: float = 1 / 30.0) -> float:

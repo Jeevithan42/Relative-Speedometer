@@ -172,6 +172,24 @@ class LogDepthEKF:
         R = (sigma_s / dtau) ** 2
         return self._update_scalar(z, np.array([0.0, 1.0]), R)
 
+    # -- recovery from gate lock-out, MATH.md section 7.5 -----------------------------
+
+    def reopen_lam(self, shift: float, var_lam: float) -> None:
+        """Move lam by `shift` and re-open its variance to at least `var_lam`.
+
+        For the case gating cannot handle on its own: a bad early measurement seeds lam
+        wrong, P collapses, and from then on every *correct* measurement is rejected as
+        an outlier. The caller decides when the evidence says the filter, not the
+        measurements, is wrong. lamdot is untouched -- Channel B keeps it honest
+        independently of lam. The cross-covariance is dropped because the old
+        correlation belonged to the state being discarded.
+        """
+        if not self._initialised:
+            return
+        self.x[0] += float(shift)
+        self.P[0, 0] = max(float(self.P[0, 0]), float(var_lam))
+        self.P[0, 1] = self.P[1, 0] = 0.0
+
     # -- physical outputs, MATH.md (4.5)-(4.7) ---------------------------------------
 
     @property

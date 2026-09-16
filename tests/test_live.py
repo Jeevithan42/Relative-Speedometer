@@ -234,14 +234,73 @@ def test_wrong_dt_scales_speed_proportionally():
     assert 1.6 < ratio < 2.5, (speeds, ratio)
 
 
-def test_manual_target_survives_missing_contrib_trackers():
-    """TrackerCSRT/KCF are contrib-only; construction must still succeed without them."""
-    f, _seq, frames = _sequence(synth.constant_gap(20.0), n=2)
+def test_manual_target_follows_a_moving_object():
+    """The live box is moved by Channel B's registration -- no OpenCV tracker at all.
+
+    The object approaches (its box grows ~40%) while jittering sideways, and only the
+    first frame's box is given. TrackerMIL could not do this: it never resized its box,
+    so the plate bracket slid off any target whose distance was actually changing.
+    """
+    f = focal_length_px(960, 60.0)
+    seq = synth.SyntheticSequence(f_px=f, image_width=960, image_height=540, seed=8,
+                                  lateral_jitter_px=3.0)
+    frames = seq.run(synth.constant_closing(Z0=16.0, v=4.0), 50)
     _cfg, session = _session(f)
     session.set_target(frames[0].image, frames[0].car_bbox, use_tracker=True)
-    assert session.target is not None
-    assert session.target.tracker_name  # names whatever backend was found
-    session.step(frames[1].image)
+    assert "ECC" in session.target.tracker_name
+
+    errs = []
+    for fr in frames:
+        est = session.step(fr.image, t=fr.t)
+        assert est is not None and not est.box_measured
+        bx, _by, bw, _bh = session.target.bbox
+        tx, _ty, tw, _th = fr.car_bbox
+        errs.append((abs((bx + bw / 2) - (tx + tw / 2)), abs(bw - tw) / tw))
+    assert frames[-1].car_bbox[2] > 1.35 * frames[0].car_bbox[2]
+    assert max(e[0] for e in errs) < 3.0, max(e[0] for e in errs)
+    assert max(e[1] for e in errs[5:]) < 0.05, max(e[1] for e in errs[5:])
+    assert session.stats.lost_frames == 0
+
+
+def test_tracked_live_session_still_measures_speed():
+    """With the box tracked (not handed in), Channel A must still anchor off the
+    refined edges and the full estimate must match ground truth."""
+    f, _seq, frames = _sequence(synth.constant_closing(Z0=24.0, v=4.0), n=100)
+    _cfg, session = _session(f)
+    session.set_target(frames[0].image, frames[0].car_bbox, use_tracker=True)
+    out = [(fr, session.step(fr.image, t=fr.t)) for fr in frames]
+    tail = [(fr, e) for fr, e in out[-40:] if e is not None and e.calibrated]
+    assert len(tail) > 20, len(tail)
+    assert np.median([abs(e.Z - fr.Z) for fr, e in tail]) < 1.0
+    assert np.median([abs(e.Zdot - fr.Zdot) for fr, e in tail]) < 0.8
+
+
+def test_calibration_applies_only_at_a_compatible_resolution():
+    """fx is in pixels of one camera mode. Using it at another mode is a silent gain
+    error on every range, so it is scaled only when the aspect matches, else refused."""
+    c = Calibration(fx=980.0, fy=980.0, cx=640.0, cy=360.0, dist=[0] * 5,
+                    image_width=1280, image_height=720)
+    fx, how = c.focal_for(1280, 720)
+    assert fx == 980.0 and how == "exact"
+    fx, how = c.focal_for(640, 360)
+    assert abs(fx - 490.0) < 1e-9 and "scaled" in how
+    fx, how = c.focal_for(640, 480)
+    assert fx is None and "recalibrate" in how
+
+
+def test_noise_profile_roundtrips_and_checks_resolution():
+    from rspeed.noise import NoiseProfile
+
+    out = Path(".") / "_test_noise.json"
+    p = NoiseProfile(sigma_w_px=2.83, sigma_s=0.00899, mean_w_px=350.0,
+                     image_width=1280, image_height=720)
+    try:
+        p.save(out)
+        back = NoiseProfile.load(out)
+        assert back == p
+        assert back.matches(1280, 720) and not back.matches(640, 480)
+    finally:
+        out.unlink(missing_ok=True)
 
 
 def _main() -> int:

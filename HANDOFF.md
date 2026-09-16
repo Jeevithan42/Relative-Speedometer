@@ -11,8 +11,8 @@ architecture, measured numbers, and the traps that cost real debugging time.
 Monocular computer vision that measures the **relative speed (range rate)** of the
 vehicle ahead, from a single ordinary camera. No radar, no stereo, no lidar.
 
-Output per frame: time-to-contact in seconds, and — once calibrated — range in metres
-and closing speed in m/s (negative = closing).
+Output per frame: time-to-contact in seconds, and — once a plate is resolvable — range
+in metres and closing speed in m/s (negative = closing).
 
 Two measurement channels, fused in one EKF over state `[lam, lamdot]`:
 
@@ -20,204 +20,234 @@ Two measurement channels, fused in one EKF over state `[lam, lamdot]`:
   (EU 0.520 m), so `Z = f*W/w`. Gives absolute metres. Needs calibration.
 - **Channel B** — scale ratio / looming. Register two views of the same patch and read
   the scale factor `s` out of the affine warp. Gives `lamdot = 1/TTC` **exactly**, with
-  no calibration at all.
+  no calibration at all. The same warp's translation is the tracker (MATH.md 5.4).
 
 Neither alone gives a speed: `Zdot = -lamdot * exp(-lam)` needs the rate from B and the
 metres from A. That is the core design idea.
 
 Language: Python 3. Dependencies: **numpy + opencv-python only.** No PyTorch, no
-ultralytics. Keeping it that way is a deliberate constraint.
+ultralytics. Vehicle detection is an ONNX model run through `cv2.dnn`. Keeping it that
+way is a deliberate, repeatedly-stated constraint.
 
 ---
 
 ## 2. Environment
 
-- Windows 10 Pro. Repo at
-  `C:\Program Files (x86)\Jeevo Projects\Relative speedometer\Relative-Speedometer`
+- Current machine: Windows 11, repo under
+  `C:\Users\thaya\OneDrive\Documents\Jeevo\Relative Spedometer\Relative-Speedometer`.
+  Python 3.12.5, **opencv-python 5.0.0**, numpy 2.5.3. Plenty of disk.
+  (The earlier machine was Windows 10 with ~284 MB free, which is why a
+  `pip install ultralytics` once failed; that constraint no longer applies, but the
+  no-ultralytics rule stands.)
 - Shell is PowerShell; a bash tool is also available.
-- Camera: **Microsoft LifeCam**, external USB, **device index 1** (index 0 is the
-  built-in laptop camera). Runs at 1280x720.
-- At 1280 px wide and 60 deg HFOV, `f = 1108.5 px`.
-- **The C: drive is nearly full (~284 MB free).** A `pip install ultralytics` already
-  failed once with "No space left on device". Assume no room for large packages.
+- Camera (as measured on the earlier machine): **Microsoft LifeCam**, external USB,
+  **device index 1** (index 0 was the built-in laptop camera). Runs at 1280x720.
+  Not yet re-checked on this machine — run `python main.py cameras` first.
+- `calibration.json`: fx = 981.0 px at 1280x720 (HFOV 66.2 deg), known-object method.
+- 8 CPU threads; YOLOX-s at 416 input takes 130–200 ms per call on OpenCV 5.
 
 ---
 
 ## 3. File map
 
 ```
-MATH.md                  All derivations. 12 sections, every symbol defined.
-README.md                Usage.
-main.py                  CLI entry. Subcommands: budget, synth, video, selftest,
+MATH.md                  All derivations. Includes 5.4 (tracking from the warp) and 7.5
+                         (gate lock-out, plate width floor).
+README.md                Usage and measured accuracy table.
+main.py                  CLI entry. budget, synth, video, fetch-model, selftest,
                          plus cameras/calibrate/live/measure-noise from cli_live.
 
 rspeed/
-  geometry.py            Pinhole math. focal_length_px, kappa, depth_from_width,
-                         Z<->lam conversions, speed_from_state, error-budget helper.
-                         PLATE_WIDTHS_M: eu .520, us .305, jp .330, au .372
-  filter.py              LogDepthEKF. State [lam, lamdot]. Exact closed-form
-                         propagation, Joseph-form covariance, chi-square gating at
-                         NIS > 9. update_absolute (H=[1,0]), update_scale (H=[0,1]).
-  scale.py               Channel B. ScaleEstimator, ECC affine registration with a
-                         Fourier-Mellin log-polar fallback. Adaptive keyframing.
-  plate.py               Subpixel edge fitting (3-point parabolic peak).
-                         refine_plate_width + ClassicalPlateLocator / YoloPlateLocator
-                         / KnownObjectLocator.
+  geometry.py            Pinhole math. PLATE_WIDTHS_M: eu .520, us .305, jp .330, au .372
+  filter.py              LogDepthEKF. State [lam, lamdot]. Exact closed-form propagation,
+                         Joseph form, chi-square gating at NIS > 9, reopen_lam().
+  scale.py               Channel B. ECC affine registration (phase-correlation seeded)
+                         with log-polar fallback. Adaptive keyframing. measure() also
+                         returns where the anchor moved (ScaleMeasurement.center).
+  plate.py               Subpixel edge fitting. ClassicalPlateLocator, DnnPlateLocator
+                         (ONNX), KnownObjectLocator.
   calib.py               KappaEstimator — the plate -> whole-car transfer.
-  estimator.py           VehicleEstimator. WHERE THE TWO CHANNELS FUSE. Read this
-                         first to understand the per-frame flow.
-  detector.py            Detection/Track types, IouTracker, YoloVehicleDetector
-                         (unused — needs ultralytics), ScriptedDetector for tests.
-  pipeline.py            RelativeSpeedPipeline. Detector striding, cost accounting.
+  estimator.py           VehicleEstimator. WHERE EVERYTHING FUSES. Read this first.
+                         Registration -> box propagation -> plate -> Channel A -> B.
+  dnn.py                 ONNX detection via cv2.dnn. Decodes YOLOX / YOLOv5 / YOLOv8(11)
+                         layouts, identified from output shape. MODEL_ZOO + fetch_model.
+  detector.py            Detection/Track types, IouTracker, ScriptedDetector for tests.
+  pipeline.py            RelativeSpeedPipeline. Detector striding, box propagation between
+                         detections, max_tracks budget, off-frame retirement, lead
+                         selection with hysteresis.
   config.py              All tunables in one dataclass.
-  synth.py               Synthetic sequence renderer with EXACT ground truth. This is
-                         how everything gets validated. Profiles: constant_closing,
-                         constant_gap, opening, brake_event, oscillating.
-  camera.py              Real-camera plumbing: enumeration, mode probing, exposure
-                         settling and diagnosis, checkerboard + known-object calibration.
-  live.py                LiveSession, manual target selection, overlay drawing.
-  cli_live.py            cameras / calibrate / live / measure-noise commands.
-  noise.py               Empirically measures sigma_w and sigma_s on YOUR camera.
-  viz.py                 Overlay showing which channel produced each number.
+  synth.py               Synthetic renderer with EXACT ground truth.
+  camera.py              Capture, exposure diagnostics, calibration, Calibration.focal_for.
+  live.py                LiveSession (manual target, ECC-tracked), overlay.
+  cli_live.py            cameras / calibrate / live / measure-noise, plus shared
+                         resolve_intrinsics / resolve_noise used by video too.
+  noise.py               Measures sigma_w and sigma_s; NoiseProfile <-> noise.json.
+  viz.py                 Overlay; boxes labelled det (detected) or trk (propagated).
 
-tests/test_math.py       21 tests, all passing
-tests/test_live.py       15 tests, all passing
-tools/verify_scale_convention.py   Proves the ECC sign convention empirically
+models/                  gitignored. `python main.py fetch-model` puts yolox_s.onnx here.
+tests/test_math.py       27 tests
+tests/test_live.py       18 tests
+tests/test_dnn.py        12 tests (decoders against hand-built tensors; one optional
+                         real-model smoke test)
+tools/verify_scale_convention.py   Proves the ECC scale AND translation conventions
 ```
 
 ---
 
-## 4. Numbers measured on the actual LifeCam
+## 4. Numbers
 
-These were measured, not guessed. Do not re-derive them.
+### Measured on the LifeCam (earlier machine) — do not re-derive
 
 ```
 sigma_w    2.830 px   (0.8% of a 350 px feature)
 sigma_s    0.00899    <- the config default of 0.004 is OPTIMISTIC by 2.2x
-scale bias +0.00015   on a static scene (good; it was +0.15 before the ROI fix)
+scale bias +0.00015   on a static scene
 ```
 
-Live run, 25 s / 142 frames at 1280x720, static scene:
+Those were measured before `measure-noise` could save its result, so **no noise.json
+exists yet**. Re-run `python main.py measure-noise` once and live/video will use it.
+
+The old live run (TrackerMIL era): 5.7 fps, TrackerMIL 109 ms/frame = 92% of cost,
+measurement maths 9.3 ms/frame.
+
+### Measured on this machine
 
 ```
-5.7 fps overall
-mean NIS       0.91     <- filter is consistent; A and B agree
-Channel B      137/142  (96%)
-Channel A      115/142  (81%)  = big 84 (59%) + plate 31 (22%)
-kappa locked   131/142  (92%)
-reported speed  -0.0 km/h median   <- correct, nothing was moving
+TrackerMIL (for reference, now removed)    138 ms/frame
+YOLOX-s ONNX, 416 input                    127-200 ms/call
+video, real-image clip, stride 5           18.5 fps end to end
+  of which: detector 183 ms/call on 20% of frames; everything else 16 ms/frame
+synthetic pipeline, stride 5, no render     ~110-170 fps
 ```
 
-**Cost breakdown — this is the headline performance fact:**
+Registration tracking accuracy: < 0.1 px horizontal on a moved + scaled synthetic
+target; converges from 60 px jumps on a 140 px window; box centre within 3 px under
+4 px/frame random lateral jitter while the target grows 60%.
 
-```
-TrackerMIL         109.2 ms/frame   92% of total cost
-measurement math     9.3 ms/frame   (~107 fps on its own)
-```
+Synthetic accuracy table (5 scenarios x strides 1/5 x 3 seeds) is in README.md.
 
-The actual speed-measuring code is fast. The tracker is the entire bottleneck.
-
-Error budget at 1280 px / 60 deg / 30 fps (from `python main.py budget`):
+Error budget at 1280 px / 66.2 deg / 30 fps (`python main.py budget --width 1280 --hfov 66.2`):
 
 ```
 range   plate w_px   sigma_v @0.3px      @2.0px
-   5 m      115.3      0.02 m/s         0.16 m/s
-  10 m       57.6      0.09 m/s         0.62 m/s
-  20 m       28.8      0.37 m/s         2.49 m/s
-  30 m       19.2      0.84 m/s         5.60 m/s
-  60 m        9.6      3.36 m/s        22.39 m/s
+   5 m      102.1      0.03 m/s         0.18 m/s
+  10 m       51.1      0.11 m/s         0.70 m/s
+  20 m       25.5      0.42 m/s         2.81 m/s
+  30 m       17.0      0.95 m/s         6.32 m/s   <- below the 18 px plate floor
 ```
 
-Usable range on this camera is roughly **5-20 m**. Past 25 m it degrades fast.
+Usable range on this camera is roughly **5-20 m**; absolute range starts at ~28 m.
 
 ---
 
 ## 5. Traps — every one of these was hit for real
 
-1. **`opencv-python-headless` silently breaks all GUI.** `cv2.namedWindow` throws
-   "The function is not implemented". It must be `opencv-python`. Verify with
-   `cv2.getBuildInformation()` — it needs `GUI: WIN32UI`, not `GUI: NONE`.
-   requirements.txt carries an explicit note about this.
+1. **`opencv-python-headless` silently breaks all GUI.** Must be `opencv-python`.
+   Verify `cv2.getBuildInformation()` shows `GUI: WIN32UI`.
 
-2. **The ECC scale is INVERTED.** `cv2.findTransformECC(template=current, input=ref)`
-   returns a warp in which a grown target means `det(A) < 1`. True scale is
-   `1/sqrt(det(A))`, not `sqrt(det(A))`. The flag `_ECC_SCALE_IS_INVERSE = True` in
-   scale.py records this; proof in tools/verify_scale_convention.py. Getting it
-   backwards flips the sign of every speed reading.
+2. **The ECC scale is INVERTED.** The warp maps current-patch coords -> keyframe-patch
+   coords, so a grown target gives `det(A) < 1`; true scale is `1/sqrt(det(A))`.
+   The same direction governs tracking: anchor in current frame = `A^-1 (u_ref - b)`.
+   Both proven in tools/verify_scale_convention.py.
 
-3. **The Hann taper must stay OFF.** It looks like it helps — it cut static-scene bias
-   from +0.0025 to -0.0001. But a fixed window is not scale-equivariant, so it drags
-   the estimate toward s = 1: against a known 1.1111 scaling it recovered 1.0868, a 22%
-   under-report that would under-report speed by about the same. There is a regression
-   test (`test_taper_must_not_be_enabled_by_default`) guarding this.
+3. **The Hann taper must stay OFF.** Not scale-equivariant: recovered 1.0868 for a true
+   1.1111. Regression test guards it.
 
-4. **Timestamp frames on arrival with the wall clock. Never use nominal fps.** A dt
-   error is not noise, it is *gain* — 2x wrong dt gives 2x wrong speed. There is a test
-   documenting exactly this (`test_wrong_dt_scales_speed_proportionally`).
+4. **Timestamp frames on arrival with the wall clock. Never use nominal fps.** A dt error
+   is gain, not noise.
 
-5. **Camera warm-up is mandatory.** The first frames come out of a buffer and give a
-   bogus fps reading (measured 29.6, when the true rate was 7.5). Also: you must
-   explicitly request `CAP_PROP_FPS = 30` — without it the LifeCam ran at 7.5 fps, with
-   it 31.8 fps.
+5. **Camera warm-up is mandatory**, and you must request `CAP_PROP_FPS = 30` (LifeCam ran
+   at 7.5 fps otherwise).
 
-6. **Auto-exposure takes about 5 seconds to ramp.** Judging exposure before then reports
-   TOO DARK on a perfectly fine scene. `settle_exposure` is time-based for this reason.
+6. **Auto-exposure takes ~5 s to ramp.** `settle_exposure` is time-based for this reason.
 
-7. **Pick the noise-measurement ROI by temporal stability, not single-frame contrast.**
-   Selecting on edge quality picked a window scoring 0.23 whose width then varied by
-   70 px on a 197 px mean — the two strongest gradients belonged to different objects
-   from frame to frame. Selecting on lowest relative spread gave sigma_w = 2.16 px.
+7. **Pick the noise ROI by temporal stability, not single-frame contrast.**
 
-8. **Keep the ROI away from the frame border.** An edge-adjacent window loses content as
-   the scene drifts and the affine fit absorbs it as apparent scale: measured bias +0.15
-   versus +0.002 for a central window.
+8. **Keep the ROI away from the frame border** (bias +0.15 vs +0.002).
 
-9. **Do not use bash heredocs to write Python containing backslash escapes.** On this
-   setup `\n` inside a heredoc gets mangled into a literal newline, producing
-   SyntaxErrors. This broke cli_live.py four separate times. Use the Edit/Write tools
-   for Python source.
+9. **Do not use bash heredocs to write Python containing backslash escapes.** `\n` gets
+   mangled. Hit again this session (caught by an assertion before writing). Use the
+   Edit/Write tools for anything with escapes.
+
+10. **OpenCV 5 removed the Darknet importer.** `cv2.dnn.readNetFromDarknet` does not exist;
+    YOLOv4-tiny .cfg/.weights will not load. ONNX only (works on 4.x and 5.x).
+
+11. **ScriptedDetector indexed boxes by call count.** With `detect_stride > 1` it replayed
+    frame 10's box on frame 50, so every strided synthetic run looked broken (4 m error)
+    and striding was never actually validated. Now indexed by the frame image. Guarded by
+    `test_scripted_detector_indexes_by_frame_not_call_count`.
+
+12. **Gate lock-out.** Wrong early plate reads seed lam, P collapses, and the chi-square
+    gate then rejects every CORRECT reading forever (5.6 m permanent error) while NIS
+    looks fine (rejections never enter the NIS log). Root cause: plates under ~18 px,
+    where the classical locator latches and repeats the same wrong width. Fix:
+    `plate_min_width_px = 18` + lock-out recovery (`reopen_after = 12`). A recovery run of
+    8 fired on the latches themselves and tripled brake error — see MATH.md 7.5.
+
+13. **A propagated box is not a measurement.** Its width is w_keyframe * s. Feeding it to
+    Channel A or the kappa transfer double-counts Channel B. Only detector-produced
+    boxes (`box_measured=True`) anchor Channel A.
+    (The old live mode fed TrackerMIL's box to kappa — MIL never resizes, so that kappa
+    was garbage whenever the object moved. Gone now.)
+
+14. **A calibration is only valid at its resolution.** `live` used to default to 640x480
+    while calibration.json is 1280x720, silently applying fx = 981 to the wrong mode.
+    Now defaults to the calibration's resolution and `Calibration.focal_for` scales
+    (same aspect) or refuses (different aspect).
+
+15. **Lead selection must have hysteresis.** A single spurious 0.52-score detection took
+    the lead within 9 frames and reset the readout. Now: penalise tracks seen once or
+    no longer detected, and switch only on a clear margin.
+
+16. **ClassicalPlateLocator crashed on boxes overhanging the top of the frame** (negative
+    slice start). Real detectors and propagated boxes produce these at close range.
 
 ---
 
 ## 6. Current status
 
-- **36/36 tests pass** (21 math + 15 live).
-- Validated end to end against exact synthetic ground truth: recovers range, speed and
-  sign correctly, and reports zero speed on a static scene.
-- Runs live on the real LifeCam with a GUI window and correct output.
-- Git: one commit (`0f8f847`). Uncommitted: modifications to requirements.txt,
-  cli_live.py, estimator.py, scale.py, tests/test_math.py; `rspeed/noise.py` is
-  untracked and new.
+- **57/57 tests pass** (27 math + 18 live + 12 dnn). `python main.py selftest`.
+- TrackerMIL deleted; tracking comes from Channel B's warp (MATH.md 5.4).
+- Automatic vehicle detection works: `fetch-model` + `video --source <file|index>`.
+  Verified end to end on a real vehicle photo zoomed to an exact looming profile:
+  lead held throughout, TTC within 2% of truth.
+- Detector striding validated for the first time (stride 5 ≈ stride 1 accuracy).
+- Git: two prior commits; this session's work is uncommitted at time of writing.
 
 **Known limitations, honestly stated:**
 
-- **No `calibration.json` exists yet.** The `calibrate` command has never been run, so
-  metric output currently rests on an assumed 60 deg HFOV. TTC is unaffected.
-- **No automatic car detection.** You must drag a box around the target by hand. This is
-  the single biggest blocker to it being a real speedometer.
-- **Never tested against an actual car or a real licence plate.** Everything so far is
-  synthetic sequences plus a desk scene.
-- TrackerMIL will likely drift or lose lock on a target whose apparent size is genuinely
-  changing — which is exactly the case it exists to handle.
+- **Never tested against real driving footage or a real moving car.** The real-image
+  test used a still photo with synthetic zoom — correct looming geometry, no real motion
+  blur, parallax, or plate.
+- **Never run on the live camera on this machine.** The live and video camera paths are
+  exercised by tests with synthetic frames only.
+- No noise.json yet (see section 4).
+- The classical plate locator produces false plates on non-plate texture (seen on the
+  truck photo, which has no readable plate). A trained ONNX plate model via
+  `--plate-model` is the fix; none is bundled.
+- Camera frames that queue in the driver buffer while the detector runs get arrival
+  timestamps slightly late. The offset is roughly constant, so dt stays right on
+  average, but it is not measured.
+- NIS runs low (0.2–0.5) in several synthetic scenarios: the filter is conservative
+  there. Not tuned further.
 
 ---
 
 ## 7. Next steps, in priority order
 
-1. **Run `calibrate`** — one minute, removes the HFOV guess.
-2. **Delete TrackerMIL.** The ECC registration in scale.py *already computes translation*
-   as a by-product of the affine warp, so the tracker is redundant. Expect roughly 18x
-   speedup (5.7 -> 50+ fps) and one fewer dependency. Proposed, awaiting a go-ahead.
-3. **ONNX vehicle detector via `cv2.dnn`** — about 12 MB, no PyTorch, fits the disk
-   budget. This is what turns "thing I boxed by hand" into "the car in front of me".
-4. **Test on a real parked car.** Box the plate at 5-10 m; sitting still should read
-   0 km/h, rolling forward negative, reversing positive.
+1. **`python main.py cameras`** on this machine — confirm the LifeCam index and fps.
+2. **`python main.py measure-noise --index <n>`** to write noise.json.
+3. **Test on a real parked car** with `video --source <n> --show`: stationary should read
+   ~0 km/h, rolling toward it negative, reversing positive. Watch the det/trk labels.
+4. **Record a real dashcam clip** and run `video --source clip.mp4 --focal <fx>`.
+5. If plates are the bottleneck: find or train an ONNX plate detector for
+   `--plate-model`.
 
 ---
 
 ## 8. Working preferences
 
-- Keep the numpy + opencv-only constraint unless there is a strong reason not to.
+- Keep the numpy + opencv-only constraint. No ultralytics.
 - Explanations should be short and lead with the answer; long build-ups bury the point.
 - Durable conceptual explanations belong in MATH.md, not only in chat.
 - Validate against synthetic ground truth before trusting anything on real footage.
